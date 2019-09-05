@@ -5,15 +5,17 @@
 #include <time.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #define alpha 0.001
 
 __global__ void SetResult(double *result_d, int correct_result, int size);
-__global__ void GetOutputLayerDelta(double *output_a, double *output_delta, double result, int size);
+__global__ void GetOutputLayerDelta(double *output_a, double *output_delta, double *result, int size);
 __global__ void GetHiddenLayerDelta(double *cur_delta, double *cur_a, double *cur_weight, double *prev_delta, int size);
 __global__ void UpdateWeight(double *cur_a, double *cur_weight, double *next_delta, int W_W, int size, double lr);
 __global__ void Print(double *a, int size);
-__global__ void Printint(int *a, int size);
+__global__ void Printint(int *a, int device, int size);
 __global__ void Sigmoid(double *a, int size);
 __global__ void Exponential(double *a, int size);
 __global__ void Softmax(double *a, double sum, int size);
@@ -23,6 +25,9 @@ __global__ void SetBackwardNotReady(int *ready, int index);
 __global__ void SetForwardNotReady(int *ready, int index);
 __global__ void PrintBw(int device, int index);
 __global__ void PrintFw(int device, int index);
+void* StartupStageOutputLayer(void *arg);
+void* StartupStageHiddenLayer(void* index);
+void* StartupStageInputLayer(void *arg);
 void MatrixMultiply(double *d_A, double *d_B, double *d_C, int A_H, int A_W, int B_W, int i);
 void SetLayer(int layer_index);
 void train_model();
@@ -42,11 +47,12 @@ struct layer_info {
 struct layer_info *layer;
 cublasHandle_t *handle;
 cudaStream_t *stream;
+pthread_t *thread;
 
-double *input_d, *input_host;
-int *result_d, *result_host, *num_node_arr, *cur_fw, *cur_bw;
+double *input_d, *input_host, *result_d, *result_host;
+int *num_node_arr, *cur_fw, *cur_bw;
 
-int num_layer = 1, num_data, epoch;
+int num_layer = 1, num_data, epoch, thr_id;
 
 clock_t start;
 
@@ -70,6 +76,7 @@ int main() {
 	// make tool
 	handle = (cublasHandle_t *)malloc(num_layer * sizeof(cublasHandle_t));
 	stream = (cudaStream_t *)malloc(num_layer * sizeof(cudaStream_t));
+	thread = (pthread_t *)malloc(num_layer * sizeof(pthread_t));
 
 	// build model
 	layer = (struct layer_info *)malloc(num_layer * sizeof(struct layer_info));
@@ -107,8 +114,8 @@ void SetLayer(int layer_index)
 	cublasCreate(&handle[layer_index]);
 	cublasSetStream(handle[layer_index], stream[layer_index]);
 
-	cudaMalloc((void**) &layer[layer_index].fw_ready, num_layer * sizeof(int));
-	cudaMalloc((void**) &layer[layer_index].bw_ready, num_layer * sizeof(int));
+	layer[layer_index].fw_ready = (int *)malloc(num_layer * sizeof(int));
+	layer[layer_index].bw_ready = (int *)malloc(num_layer * sizeof(int));
 	cudaMalloc((void**) &layer[layer_index].one, sizeof(int));
 	one_h = (int *)malloc(sizeof(int));
 	one_h[0] = 1;
@@ -153,13 +160,13 @@ void SetLayer(int layer_index)
 
 void train_model() 
 {
-	int result_index = 0, input_index = 0;
+	int result_index = 0, input_index = 0, status;
 	FILE* pFile = NULL;
 	char str_tmp[num_node_arr[0] * 3], *p;
-	double sum;
+	int t1, t2 = 1;
 
 	pFile = fopen("mnist_train.csv", "r");
-	result_host = (int *)malloc(num_data * sizeof(int));
+	result_host = (double *)malloc(num_data * sizeof(double));
 	input_host = (double *)malloc(num_data * num_node_arr[0] * sizeof(double));
 	if(pFile != NULL)
     {   
@@ -197,80 +204,14 @@ void train_model()
 	result_index = input_index = 0;
 
 	// startup stage
-	// input layer
-	cudaSetDevice(0);
-	for(int j = 0; j < num_layer; j++)
-	{	
-		cudaMemcpyAsync(layer[0].a[j], input_d + result_index++ * num_node_arr[0], num_node_arr[0] * sizeof(double), cudaMemcpyDeviceToDevice, stream[0]);
-		MatrixMultiply(layer[0].a[j], layer[0].weight[j], layer[0].a_next[j], 1, num_node_arr[0], num_node_arr[1], 0);
-		Sigmoid<<<(num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a_next[j], num_node_arr[1]);
-		cudaMemcpyPeerAsync(layer[1].a[j], 1, layer[0].a_next[j], 0, num_node_arr[1] * sizeof(double), stream[0]);
-		cudaMemcpyPeerAsync(layer[1].fw_ready + j, 1, layer[0].one , 0, sizeof(int), stream[0]);
-		PrintFw<<<1, 1, 0, stream[0]>>>(0, j);
-	} // Forward  X num_layer
-	cudaDeviceSynchronize();
-	BackwardWait<<<1, 1, 0, stream[0]>>>(layer[0].bw_ready, 0, 0);
-	UpdateWeight<<<(num_node_arr[0] * num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a[0], layer[0].weight[0], layer[0].delta_next[0], num_node_arr[1], num_node_arr[1] * num_node_arr[0], alpha);
-	PrintBw<<<1, 1, 0, stream[0]>>>(0, 0);
-	SetBackwardNotReady<<<1, 1, 0, stream[0]>>>(layer[0].bw_ready, 0);
+	thr_id = pthread_create(&thread[0], NULL, StartupStageInputLayer, NULL);
+	thr_id = pthread_create(&thread[1], NULL, StartupStageHiddenLayer, (void *)&t2);
 
-	cudaSetDevice(1);
-	Printint<<<1, 1, 0, stream[1]>>>(layer[1].fw_ready, num_layer);
-	cudaStreamSynchronize(stream[1]);
+	// for(int i = 1; i < num_layer - 1; i++)
+	// 	thr_id = pthread_create(&thread[i], NULL, StartupStageHiddenLayer, (void *)&t); 	
 
-	cudaSetDevice(0);
-	cudaStreamSynchronize(stream[0]);
-	
-	/*
-	// hidden layer
-	for(int i = 1; i < num_layer - 1; i++)
-	{
-		cudaSetDevice(i);
-		for(int j = 0; j < num_layer; j++)
-		{
-			Printint<<<1, 1, 0, stream[i]>>>(layer[i].fw_ready, num_layer);
-			ForwardWait<<<1, 1, 0, stream[i]>>>(layer[i].fw_ready, i, j);
-			MatrixMultiply(layer[i].a[j], layer[i].weight[j], layer[i].a_next[j], 1, num_node_arr[i], num_node_arr[i + 1], i);
-			if(i != num_layer - 2)
-				Sigmoid<<<(num_node_arr[i + 1] + 1023) / 1024, 1024, 0, stream[i]>>>(layer[i].a_next[j], num_node_arr[i + 1]);
-			
-			cudaMemcpyPeerAsync(layer[i + 1].a[j], i + 1, layer[i].a_next[j], i, num_node_arr[i + 1] * sizeof(double), stream[i]);
-			cudaMemcpyPeerAsync(layer[i + 1].fw_ready + j, i + 1, layer[i].one , i, sizeof(int), stream[i]);
-			SetForwardNotReady<<<1, 1, 0, stream[i]>>>(layer[i].fw_ready, j);
-			PrintFw<<<1, 1, 0, stream[i]>>>(i, j);
-		}
-		for(int j = 0; j < i + 1; j++)
-		{
-			BackwardWait<<<1, 1, 0, stream[i]>>>(layer[i].bw_ready, i, j);
-			MatrixMultiply(layer[i].weight[j], layer[i].delta_next[j], layer[i].delta[j], num_node_arr[i], num_node_arr[i + 1], 1, i);
-			GetHiddenLayerDelta<<<(num_node_arr[i] + 1023) / 1024, 1024>>>(layer[i].delta[j], layer[i].a[j], layer[i].weight[j], layer[i].delta_next[j], num_node_arr[i]);
-			cudaMemcpyPeerAsync(layer[i - 1].delta_next[j], i - 1, layer[i].delta[j], i, num_node_arr[i] * sizeof(double), stream[i]);
-			cudaMemcpyPeerAsync(layer[i - 1].bw_ready + j, i - 1, layer[i].one , i, sizeof(int), stream[0]);
-			SetBackwardNotReady<<<1, 1, 0, stream[i]>>>(layer[i].bw_ready, j);
-			PrintBw<<<1, 1, 0, stream[i]>>>(i, j);
-		}
-	}
-
-	
-	// output layer
-	cudaSetDevice(num_layer - 1);
-	for(int j = 0; j < num_layer; j++)
-	{
-		ForwardWait<<<1, 1, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].fw_ready, num_layer - 1, j);
-		Exponential<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024>>>(layer[num_layer - 1].a[j], num_node_arr[num_layer - 1]);
-		cublasDasum(handle[num_layer - 1], num_node_arr[num_layer - 1], layer[num_layer - 1].a[j], 1, &sum);
-		Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024>>>(layer[num_layer - 1].a[j], sum, num_node_arr[num_layer - 1]);
-		PrintFw<<<1, 1, 0, stream[num_layer - 1]>>>(num_layer - 1, j);
-		PrintBw<<<1, 1, 0, stream[num_layer - 1]>>>(num_layer - 1, j);
-		GetOutputLayerDelta<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024>>>(layer[num_layer - 1].a[j], layer[num_layer - 1].delta[j], result_d[j], num_node_arr[num_layer - 1]);
-		cudaMemcpyPeerAsync(layer[num_layer - 2].delta_next[j], num_layer - 2, layer[num_layer - 1].delta[j], num_layer - 1, num_node_arr[num_layer - 1] * sizeof(double), stream[num_layer - 1]);
-		SetForwardNotReady<<<1, 1, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].fw_ready, j);
-	}
-
-	for(int i=0; i< num_layer; i++)
-		cudaStreamSynchronize(stream[i]);
-		*/
-
+	// for(int i = 0; i < num_layer ; i++)
+	// 	pthread_join(thread[i], (void **) &status);
 	/*
 	// steady stage
 	// input layer
@@ -303,17 +244,97 @@ void train_model()
 	return; 
 }
 
+void* StartupStageInputLayer(void *arg)
+{
+	cudaSetDevice(0);
+	for(int j = 0; j < num_layer; j++)
+	{	
+		cudaMemcpyAsync(layer[0].a[j], input_d + j * num_node_arr[0], num_node_arr[0] * sizeof(double), cudaMemcpyDeviceToDevice, stream[0]);
+		MatrixMultiply(layer[0].a[j], layer[0].weight[j], layer[0].a_next[j], 1, num_node_arr[0], num_node_arr[1], 0);
+		Sigmoid<<<(num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a_next[j], num_node_arr[1]);
+		cudaMemcpyPeerAsync(layer[1].a[j], 1, layer[0].a_next[j], 0, num_node_arr[1] * sizeof(double), stream[0]);
+		cudaMemcpyAsync(layer[1].fw_ready + j, layer[0].one , sizeof(int), stream[0], cudaMemcpyDeviceToHost);
+		PrintFw<<<1, 1, 0, stream[0]>>>(0, j);
+		cudaStreamSynchronize(stream[0]);
+	} // Forward  X num_layer
+	while(layer[0].bw_ready[0] == 0) {}
+	// BackwardWait<<<1, 1, 0, stream[0]>>>(layer[0].bw_ready, 0, 0);
+	UpdateWeight<<<(num_node_arr[0] * num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a[0], layer[0].weight[0], layer[0].delta_next[0], num_node_arr[1], num_node_arr[1] * num_node_arr[0], alpha);
+	PrintBw<<<1, 1, 0, stream[0]>>>(0, 0);
+	cudaStreamSynchronize(stream[0]);
+	SetBackwardNotReady<<<1, 1, 0, stream[0]>>>(layer[0].bw_ready, 0);
+}
+
+void* StartupStageHiddenLayer(void* index)
+{
+	int i = *((int *)index);
+	cudaSetDevice(i);
+	for(int j = 0; j < num_layer; j++)
+	{
+		Printint<<<1, 1, 0, stream[i]>>>(layer[i].fw_ready, i, num_layer);
+		cudaStreamSynchronize(stream[i]);
+		while(layer[i].fw_ready[j] == 0) {}
+		// ForwardWait<<<1, 1, 0, stream[i]>>>(layer[i].fw_ready, i, j);
+		Printint<<<1, 1, 0, stream[i]>>>(layer[i].fw_ready, i, num_layer);
+		cudaStreamSynchronize(stream[i]);
+		MatrixMultiply(layer[i].a[j], layer[i].weight[j], layer[i].a_next[j], 1, num_node_arr[i], num_node_arr[i + 1], i);
+
+		if(i != num_layer - 2)
+			Sigmoid<<<(num_node_arr[i + 1] + 1023) / 1024, 1024, 0, stream[i]>>>(layer[i].a_next[j], num_node_arr[i + 1]);
+		
+		cudaMemcpyPeerAsync(layer[i + 1].a[j], i + 1, layer[i].a_next[j], i, num_node_arr[i + 1] * sizeof(double), stream[i]);
+		cudaMemcpyAsync(layer[i + 1].fw_ready + j, layer[i].one , sizeof(int), stream[i], cudaMemcpyDeviceToHost);
+		SetForwardNotReady<<<1, 1, 0, stream[i]>>>(layer[i].fw_ready, j);
+		PrintFw<<<1, 1, 0, stream[i]>>>(i, j);
+		cudaStreamSynchronize(stream[i]);
+	}
+	
+	for(int j = 0; j < i + 1; j++)
+	{
+		while(layer[i].bw_ready[j] == 0) {}
+		// BackwardWait<<<1, 1, 0, stream[i]>>>(layer[i].bw_ready, i, j);
+		MatrixMultiply(layer[i].weight[j], layer[i].delta_next[j], layer[i].delta[j], num_node_arr[i], num_node_arr[i + 1], 1, i);
+		GetHiddenLayerDelta<<<(num_node_arr[i] + 1023) / 1024, 1024>>>(layer[i].delta[j], layer[i].a[j], layer[i].weight[j], layer[i].delta_next[j], num_node_arr[i]);
+		cudaMemcpyPeerAsync(layer[i - 1].delta_next[j], i - 1, layer[i].delta[j], i, num_node_arr[i] * sizeof(double), stream[i]);
+		cudaMemcpyAsync(layer[i - 1].bw_ready + j, layer[i].one , sizeof(int), stream[i], cudaMemcpyDeviceToHost);
+		SetBackwardNotReady<<<1, 1, 0, stream[i]>>>(layer[i].bw_ready, j);
+		PrintBw<<<1, 1, 0, stream[i]>>>(i, j);
+		cudaStreamSynchronize(stream[i]);
+	}
+}
+
+void* StartupStageOutputLayer(void *arg)
+{
+	double sum;
+	cudaSetDevice(num_layer - 1);
+	for(int j = 0; j < num_layer; j++)
+	{
+		ForwardWait<<<1, 1, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].fw_ready, num_layer - 1, j);
+		PrintFw<<<1, 1, 0, stream[num_layer - 1]>>>(num_layer - 1, j);
+		cudaStreamSynchronize(stream[num_layer - 1]);
+		Exponential<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024>>>(layer[num_layer - 1].a[j], num_node_arr[num_layer - 1]);
+		cublasDasum(handle[num_layer - 1], num_node_arr[num_layer - 1], layer[num_layer - 1].a[j], 1, &sum);
+		Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024>>>(layer[num_layer - 1].a[j], sum, num_node_arr[num_layer - 1]);
+		PrintBw<<<1, 1, 0, stream[num_layer - 1]>>>(num_layer - 1, j);
+		cudaStreamSynchronize(stream[num_layer - 1]);
+		GetOutputLayerDelta<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024>>>(layer[num_layer - 1].a[j], layer[num_layer - 1].delta[j], result_d + j, num_node_arr[num_layer - 1]);
+		cudaMemcpyPeerAsync(layer[num_layer - 2].delta_next[j], num_layer - 2, layer[num_layer - 1].delta[j], num_layer - 1, num_node_arr[num_layer - 1] * sizeof(double), stream[num_layer - 1]);
+		cudaMemcpyAsync(layer[num_layer - 2].bw_ready + j, layer[num_layer - 1].one , sizeof(int), stream[num_layer - 1], cudaMemcpyDeviceToHost);
+		SetForwardNotReady<<<1, 1, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].fw_ready, j);
+	}
+}
+
 __global__ void ForwardWait(int *ready, int device, int index)
 {
 	while(ready[index] == 0) {
-		//printf("device : %d , fw: %d\n", device, index);
+		// printf("waiting device : %d , fw: %d\n", device, index);
 	}
 }
 
 __global__ void BackwardWait(int *ready, int device, int index)
 {
 	while(ready[index] == 0) {
-		//printf("device : %d , bw: %d\n", device, index);
+		// printf("waiting device : %d , bw: %d\n", device, index);
 	}
 }
 
@@ -404,12 +425,12 @@ void MatrixMultiply(double *d_A, double *d_B, double *d_C, int A_H, int A_W, int
 }
 
 
-__global__ void GetOutputLayerDelta(double *output_a, double *output_delta, double result, int size)
+__global__ void GetOutputLayerDelta(double *output_a, double *output_delta, double *result, int size)
 {
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
 	if(i < size)
 	{
-		if(i != result)
+		if(i != result[0])
 			output_delta[i] = 0.0 - output_a[i];
 		else
 			output_delta[i] = 1.0 - output_a[i];
@@ -465,8 +486,9 @@ __global__ void Print(double *a, int size)
 	printf("\n");
 }
 
-__global__ void Printint(int *a, int size)
+__global__ void Printint(int *a, int device, int size)
 {
+	printf("device : %d , ", device);
 	for(int i=0; i<size; i++)
 		printf(" %d /", a[i]);
 	printf("\n");
@@ -479,7 +501,7 @@ __global__ void PrintFw(int device, int index)
 
 __global__ void PrintBw(int device, int index)
 {
-	printf("device : %d , fw : %d\n", device, index);
+	printf("device : %d , bw : %d\n", device, index);
 }
 
 
