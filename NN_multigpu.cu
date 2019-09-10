@@ -5,10 +5,6 @@
 #include <time.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <pthread.h>
-#include <unistd.h>
-#include "helper_cuda.h"
-#include <omp.h>
 
 #define alpha 0.001
 
@@ -213,6 +209,11 @@ void train_model()
 	cudaMemcpy(input_d, input_host, num_data * num_node_arr[0] * sizeof(double), cudaMemcpyHostToDevice);
 
 	result_index = input_index = num_layer;
+	for(int i = 0; i < num_layer; i++)
+		cur_fw[i] = 0;
+	for(int i = 0; i < num_layer - 1; i++)
+		cur_bw[i] = i + 1;
+	cur_bw[num_layer - 1] = 0;
 
 	// startup stage
 	// input layer
@@ -257,7 +258,7 @@ void train_model()
 
 			PrintFw<<<1, 1, 0, stream[i]>>>(i, j);
 		}
-		// cudaStreamSynchronize(stream[i]);
+
 		for(int j = 0; j < i + 1; j++)
 		{
 			WaituntilOne<<<1, 1, 0, stream[i]>>>(layer[i].bw_ready, j, i, 0);
@@ -302,16 +303,16 @@ void train_model()
 		cudaSetDevice(i);
 		cudaStreamSynchronize(stream[i]);
 	}
-	
-	for(int i = 0; i < num_layer; i++)
-		cur_fw[i] = 0;
-	for(int i = 0; i < num_layer - 1; i++)
-		cur_bw[i] = i + 1;
-	cur_bw[num_layer - 1] = 0;
+
+	printf("\nStart Steady stage\n");
 
 	// steady stage
 	while(1)
 	{
+		// printf("\ninput index : %d, result index : %d\n", input_index, result_index);
+		if(input_index == num_data)
+			break;
+
 		// input layer
 		cudaSetDevice(0);
 		cudaMemcpyAsync(layer[0].a[cur_fw[0]], input_d + input_index++ * num_node_arr[0], num_node_arr[0] * sizeof(double), cudaMemcpyDeviceToDevice, stream[0]);
@@ -384,29 +385,33 @@ void train_model()
 		}
 
 		// output layer
-		
+		cudaSetDevice(num_layer - 1);
 
-		// for(int i = 0; i < num_layer; i++)
-		// {	
-		// 	cudaSetDevice(i);
-		// 	cudaStreamSynchronize(stream[i]);
-		// }
+		WaituntilOne<<<1, 1, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].fw_ready, cur_fw[num_layer - 1], num_layer - 1, 1);
 
-		// printf("cur_fw : ");
-		// for(int i = 0; i < num_layer; i++)
-		// 	printf("%d ", cur_fw[i]);
-		// printf("\n");
-		// printf("cur_bw : ");
-		// for(int i = 0; i < num_layer; i++)
-		// 	printf("%d ", cur_bw[i]);
-		// printf("\n");
+		Exponential<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].a[cur_fw[num_layer - 1]], num_node_arr[num_layer - 1]);
+		cublasDasum(handle[num_layer - 1], num_node_arr[num_layer - 1], layer[num_layer - 1].a[cur_fw[num_layer - 1]], 1, &sum);
+		Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].a[cur_fw[num_layer - 1]], sum, num_node_arr[num_layer - 1]);
 
-		cudaSetDevice(1);
-		dummy<<<1, 1, 0, stream[1]>>>();
-		cudaStreamSynchronize(stream[1]);
+		PrintFw<<<1, 1, 0, stream[num_layer - 1]>>>(num_layer - 1, cur_fw[num_layer - 1]);
+
+		GetOutputLayerDelta<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].a[cur_fw[num_layer - 1]], layer[num_layer - 1].delta[cur_bw[num_layer - 1]], result_d + result_index++, num_node_arr[num_layer - 1]);
+
+		WaituntilZero<<<1, 1, 0, stream[num_layer - 1]>>>(layer[num_layer - 2].bw_ready, cur_fw[num_layer - 1], num_layer - 2, 0);
+
+		cudaMemcpyPeerAsync(layer[num_layer - 2].delta_next[cur_fw[num_layer - 1]], num_layer - 2, layer[num_layer - 1].delta[cur_fw[num_layer - 1]], num_layer - 1, num_node_arr[num_layer - 1] * sizeof(double), stream[num_layer - 1]);
+		cudaMemcpyAsync(layer[num_layer - 1].fw_ready + cur_fw[num_layer - 1], layer[num_layer - 1].index_arr, sizeof(int), cudaMemcpyDeviceToDevice, stream[num_layer - 1]);
+		cudaMemcpyPeerAsync(layer[num_layer - 2].bw_ready + cur_fw[num_layer - 1], num_layer - 2, layer[num_layer - 1].index_arr + 1, num_layer - 1, sizeof(int), stream[num_layer - 1]);
+
+		PrintBw<<<1, 1, 0, stream[num_layer - 1]>>>(num_layer - 1, cur_fw[num_layer - 1]);
+
+		if(cur_fw[num_layer - 1] == num_layer - 1)
+			cudaMemcpyAsync(cur_fw + num_layer - 1, layer[num_layer - 1].index_arr, sizeof(int), cudaMemcpyDeviceToHost, stream[num_layer - 1]);
+		else				
+			cudaMemcpyAsync(cur_fw + num_layer - 1, layer[num_layer - 1].index_arr + cur_fw[num_layer - 1] + 1, sizeof(int), cudaMemcpyDeviceToHost, stream[num_layer - 1]);
 	}
 
-	return; 
+	
 }
 
 /*
@@ -564,8 +569,8 @@ __global__ void PrintBw(int device, int index)
 __global__ void WaituntilZero(int *ready, int index, int device, int fb)
 {
 	while(ready[index] == 1) {
-		for(int i = 0; i < 100000000; i++)
-		{ }
+		// for(int i = 0; i < 100; i++)
+		// { }
 		printf("device : %d, ", device);
 		if(fb == 1)
 			printf("direction : fw, ");
@@ -579,8 +584,8 @@ __global__ void WaituntilOne(int *ready, int index, int device, int fb)
 {
 	
 	while(ready[index] == 0) { 
-		for(int i = 0; i < 100000000; i++)
-		{ }
+		// for(int i = 0; i < 10000000; i++)
+		// { }
 		printf("device : %d, ", device);
 		if(fb == 1)
 			printf("direction : fw, ");
