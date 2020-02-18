@@ -6,28 +6,29 @@
 
 #define alpha 0.001
 
+__global__ void Print(double *a, int size);
+__global__ void Printint(int *a, int device, int size);
+__global__ void PrintBw(int device, int index);
+__global__ void PrintFw(int device, int index);
+
 __global__ void SetResult(double *result_d, int correct_result, int size);
 __global__ void GetOutputLayerDelta(double *output_a, double *output_delta, double *result, int size);
 __global__ void GetHiddenLayerDelta(double *cur_delta, double *cur_a, double *cur_weight, double *prev_delta, int size);
 __global__ void UpdateWeight(double *cur_a, double *cur_weight, double *next_delta, int W_W, int size, double lr);
-__global__ void Print(double *a, int size);
-__global__ void Printint(int *a, int device, int size);
 __global__ void Sigmoid(double *a, int size);
 __global__ void Exponential(double *a, int size);
 __global__ void Softmax(double *a, double sum, int size);
-__global__ void PrintBw(int device, int index);
-__global__ void PrintFw(int device, int index);
-__global__ void WaituntilZero(int *ready, int index);
-__global__ void WaituntilOne(int *ready, int index);
+__global__ void WaituntilZero(int *ready, int index, int device, int flag);
+__global__ void WaituntilOne(int *ready, int index, int device, int flag);
 __global__ void SetFlag(int *ready, int index);
-__global__ void dummy();
-void* StartupStageOutputLayer(void *arg);
-void* StartupStageHiddenLayer(void* index);
-void* StartupStageInputLayer(void *arg);
+__global__ void SetBuffer(int *index);
+
 void MatrixMultiply(double *d_A, double *d_B, double *d_C, int A_H, int A_W, int B_W, int i);
 void SetLayer(int layer_index);
 void train_model();
 void test_accuracy();
+
+
 
 struct layer_info {
 	double *weight;
@@ -37,8 +38,8 @@ struct layer_info {
 	double **delta_next;
 	int *is_fw_input_ready;
 	int *is_bw_input_ready;
-	int *is_fw_act_ready;
-	int *is_bw_delta_ready;
+	int *is_fw_output_ready;
+	int *is_bw_output_ready;
 	int *cur_fw_cm;
 	int *cur_bw_cm;
 	int *cur_fw_cp;
@@ -76,7 +77,6 @@ int main() {
 	// make tool
 	handle = (cublasHandle_t *)malloc(num_layer * sizeof(cublasHandle_t));
 	stream = (cudaStream_t *)malloc(2 * num_layer * sizeof(cudaStream_t));
-	sum = (double *)malloc(2 * sizeof(double));
 
 	// build model
 	layer = (struct layer_info *)malloc(num_layer * sizeof(struct layer_info));
@@ -101,6 +101,12 @@ int main() {
 	printf("epoch : ");
 	scanf(" %d", &epoch);
 	train_model();
+	for(int i = 0; i < num_layer; i++)
+	{
+		cudaSetDevice(i);
+		cudaDeviceSynchronize();
+	}
+	printf("finished\n");
 
 	return 0;
 }
@@ -116,10 +122,10 @@ void SetLayer(int layer_index)
 	cublasCreate(&handle[layer_index]);
 	cublasSetStream(handle[layer_index], stream[2 * layer_index]);
 
-	cudaMallocManaged((void**) &layer[layer_index].is_fw_act_ready, 2 * sizeof(int));
-	cudaMallocManaged((void**) &layer[layer_index].is_bw_delta_ready, 2 * sizeof(int));
-	layer[layer_index].is_fw_act_ready[0] = layer[layer_index].is_fw_act_ready[1] = 0;
-	layer[layer_index].is_bw_delta_ready[0] = layer[layer_index].is_bw_delta_ready[0] = 0;
+	cudaMallocManaged((void**) &layer[layer_index].is_fw_output_ready, 2 * sizeof(int));
+	cudaMallocManaged((void**) &layer[layer_index].is_bw_output_ready, 2 * sizeof(int));
+	layer[layer_index].is_fw_output_ready[0] = layer[layer_index].is_fw_output_ready[1] = 0;
+	layer[layer_index].is_bw_output_ready[0] = layer[layer_index].is_bw_output_ready[0] = 0;
 
 	cudaMallocManaged((void**) &layer[layer_index].is_fw_input_ready, 2 * sizeof(int));
 	cudaMallocManaged((void**) &layer[layer_index].is_bw_input_ready, 2 * sizeof(int));
@@ -128,11 +134,11 @@ void SetLayer(int layer_index)
 	
 	cudaMallocManaged((void**) &layer[layer_index].cur_fw_cm, sizeof(int));
 	cudaMallocManaged((void**) &layer[layer_index].cur_bw_cm, sizeof(int));
-	layer[layer_index].cur_fw_cm = layer[layer_index].cur_bw_cm = 0;
+	layer[layer_index].cur_fw_cm[0] = layer[layer_index].cur_bw_cm[0] = 0;
 
 	cudaMallocManaged((void**) &layer[layer_index].cur_fw_cp, sizeof(int));
 	cudaMallocManaged((void**) &layer[layer_index].cur_bw_cp, sizeof(int));
-	layer[layer_index].cur_fw_cp = layer[layer_index].cur_bw_cp = 0;
+	layer[layer_index].cur_fw_cp[0] = layer[layer_index].cur_bw_cp[0] = 0;
 
 	layer[layer_index].a = (double **)malloc(2 * sizeof(double *));
 	for(int i = 0; i < 2; i++)
@@ -167,11 +173,17 @@ void SetLayer(int layer_index)
 		cudaDeviceSynchronize();
 		free(weight_host);
 	}
+
+	// output layer
+	if(layer_index == num_layer - 1)
+	{
+		cudaMallocManaged((void **) &sum, 2 * sizeof(double));
+		sum[0] = sum[1] = 1;
+	}
 }
 
 void train_model() 
 {
-	int result_index = 0, input_index = 0;
 	FILE* pFile = NULL;
 	char str_tmp[num_node_arr[0] * 3], *p;
 
@@ -180,12 +192,10 @@ void train_model()
 	input_host = (double *)malloc(num_data * num_node_arr[0] * sizeof(double));
 	if(pFile != NULL)
     {   
-		for(int r_index = 0, i_index = 0; ;)
+		for(int r_index = 0, i_index = 0; r_index < num_data;)
 		{
-			fgets(str_tmp, num_node_arr[0] * 5, pFile);
-			if (feof(pFile))
-				break;
-			
+			fgets(str_tmp, num_node_arr[0] * 3, pFile);
+
 			// set result
 			p = strtok(str_tmp, ",");
 			if(atoi(p) == 0)
@@ -210,67 +220,52 @@ void train_model()
 	cudaMalloc((void**) &input_d, num_data * num_node_arr[0] * sizeof(double));
 	cudaMemcpy(input_d, input_host, num_data * num_node_arr[0] * sizeof(double), cudaMemcpyHostToDevice);
 
-	result_index = input_index = num_layer;
-	
-	///////////////////////////////////////////////////////////////////
-	// startup stage //////////////////////////////////////////////////
-	///////////////////////////////////////////////////////////////////
-
 	///////////////////////////////////////////////////////////////////
 	// input layer ////////////////////////////////////////////////////
 	///////////////////////////////////////////////////////////////////
 
 	cudaSetDevice(0);
-	for(int j = 0; j < num_layer; j++)
-	{	// forward X num_layer
+	for(int j = 0; j < 2 * num_layer - 1; j++)
+	{	// Start Stage = (2 * num_layer - 1) X Forward
 		// copy input data
-		cudaMemcpyAsync(layer[0].a, input_d + j * num_node_arr[0], num_node_arr[0] * sizeof(double), cudaMemcpyDeviceToDevice, stream[0]);
+		cudaMemcpyAsync(layer[0].a[layer[0].cur_fw_cp[0]], input_d + j * num_node_arr[0], num_node_arr[0] * sizeof(double), cudaMemcpyDeviceToDevice, stream[0]);
 
 		// wait for current layer's activation buffer is empty
-		WaituntilZero<<<1, 1, 0, stream[0]>>>(layer[0].is_fw_act_ready, layer[0].cur_fw_cp);
-
+		WaituntilZero<<<1, 1, 0, stream[0]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cp[0], 0, 0);
+		
 		// compute activation
-		MatrixMultiply(layer[0].a[layer[0].cur_fw_cp], layer[0].weight, layer[0].a_next[layer[0].cur_fw_cp], 1, num_node_arr[0], num_node_arr[1], 0);
-		Sigmoid<<<(num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a_next[layer[0].cur_fw_cp], num_node_arr[1]);
-
+		MatrixMultiply(layer[0].a[layer[0].cur_fw_cp[0]], layer[0].weight, layer[0].a_next[layer[0].cur_fw_cp[0]], 1, num_node_arr[0], num_node_arr[1], 0);
+		Sigmoid<<<(num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a_next[layer[0].cur_fw_cp[0]], num_node_arr[1]);
+		
 		// current layer's activation buffer is full
-		SetFlag<<<1, 1, 0, stream[0]>>>(layer[0].is_fw_act_ready, layer[0].cur_fw_cp);
-
+		SetFlag<<<1, 1, 0, stream[0]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cp[0]);
+		
 		// buffer exchange
 		SetBuffer<<<1, 1, 0, stream[0]>>>(layer[0].cur_fw_cp);
 
 		// wait for current layer's activation buffer is full
-		WaituntilOne<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_act_ready, layer[0].cur_fw_cm);
-
+		WaituntilOne<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cm[0], 0, 0);
+		
 		// wait for next layer's forward input buffer is empty
-		WaituntilZero<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, layer[0].cur_fw_cm);
-
+		WaituntilZero<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, layer[0].cur_fw_cm[0], 0, 0);
+		
 		// copy activation to next layer
-		cudaMemcpyPeerAsync(layer[1].a[layer[0].cur_fw_cm], 1, layer[0].a_next[layer[0].cur_fw_cm], 0, num_node_arr[1] * sizeof(double), stream[1]);
-
+		cudaMemcpyPeerAsync(layer[1].a[layer[0].cur_fw_cm[0]], 1, layer[0].a_next[layer[0].cur_fw_cm[0]], 0, num_node_arr[1] * sizeof(double), stream[1]);
+		
 		// next layer's forward input buffer is full
-		SetFlag<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, layer[0].cur_fw_cm);
-
+		SetFlag<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, layer[0].cur_fw_cm[0]);
+		
 		// current layer's activation buffer is empty
-		SetFlag<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_act_ready, layer[0].cur_fw_cm);
+		SetFlag<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cm[0]);
 
 		// buffer exchange
 		SetBuffer<<<1, 1, 0, stream[1]>>>(layer[0].cur_fw_cm);
+		PrintFw<<<1, 1, 0, stream[1]>>>(0, j);
+		printf("0\n");
 	}
 
-	// Backward
-	// wait for current layer's backward input buffer is full
-	WaituntilOne<<<1, 1, 0, stream[0]>>>(layer[0].is_bw_input_ready, layer[0].cur_bw_cp);
-
-	// update weight
-	UpdateWeight<<<(num_node_arr[0] * num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a[layer[0].cur_bw_cp], layer[0].weight, layer[0].delta_next[layer[0].cur_bw_cp], num_node_arr[1], num_node_arr[1] * num_node_arr[0], alpha);
-
-	// current layer's backward input buffer is empty
-	SetFlag<<<1, 1, 0, stream[0]>>>(layer[0].is_bw_delta_ready, layer[0].cur_bw_cp);
-
-	// buffer exchange
-	SetBuffer<<<1, 1, 0, stream[0]>>>(layer[0].cur_bw_cp);
-
+	// Steady Stage = 1B1F
+	
 	///////////////////////////////////////////////////////////////////
 	// hidden layer ///////////////////////////////////////////////////
 	///////////////////////////////////////////////////////////////////
@@ -278,250 +273,149 @@ void train_model()
 	for(int i = 1; i < num_layer - 1; i++)
 	{
 		cudaSetDevice(i);
-		for(int j = 0; j < num_layer; j++)
-		{	// forward X num_layer
+		for(int j = 0; j < 2 * (num_layer - i) - 1; j++)
+		{	// Start Stage = (2 * (num_layer - i) - 1) X Forward
 			// wait for current layer's forward input buffer is full
-			WaituntilOne<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_fw_input_ready, layer[i].cur_fw_cp);
+			WaituntilOne<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_fw_input_ready, layer[i].cur_fw_cp[0], i, 0);
 
 			// wait for current layer's activation buffer is empty
-			WaituntilZero<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_fw_act_ready, layer[i].cur_fw_cp);
+			WaituntilZero<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_fw_output_ready, layer[i].cur_fw_cp[0], i, 0);
 
 			// compute activation
-			MatrixMultiply(layer[i].a[layer[i].cur_fw_cp], layer[i].weight, layer[i].a_next[layer[i].cur_fw_cp], 1, num_node_arr[i], num_node_arr[i + 1], i);
+			MatrixMultiply(layer[i].a[layer[i].cur_fw_cp[0]], layer[i].weight, layer[i].a_next[layer[i].cur_fw_cp[0]], 1, num_node_arr[i], num_node_arr[i + 1], i);
 			if(i != num_layer - 2)
-				Sigmoid<<<(num_node_arr[i + 1] + 1023) / 1024, 1024, 0, stream[2 * i]>>>(layer[i].a_next[layer[i].cur_fw_cp], num_node_arr[i + 1]);
+				Sigmoid<<<(num_node_arr[i + 1] + 1023) / 1024, 1024, 0, stream[2 * i]>>>(layer[i].a_next[layer[i].cur_fw_cp[0]], num_node_arr[i + 1]);
 
 			// current layer's activation buffer is full
-			SetFlag<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_fw_act_ready, layer[i].cur_fw_cp);
+			SetFlag<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_fw_output_ready, layer[i].cur_fw_cp[0]);
 
 			// current layer's forward input buffer is empty
-			SetFlag<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_fw_input_ready, layer[i].cur_fw_cp);
+			SetFlag<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_fw_input_ready, layer[i].cur_fw_cp[0]);
 
 			// buffer exchange
 			SetBuffer<<<1, 1, 0, stream[2 * i]>>>(layer[i].cur_fw_cp);
 
 			// wait for current layer's activation buffer is full
-			WaituntilOne<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].is_fw_act_ready, layer[i].cur_fw_cm);
+			WaituntilOne<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].is_fw_output_ready, layer[i].cur_fw_cm[0], i, 0);
 				
 			// wait for next layer's forward input buffer is empty
-			WaituntilZero<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i + 1].is_fw_input_ready, layer[i].cur_fw_cm);
+			WaituntilZero<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i + 1].is_fw_input_ready, layer[i].cur_fw_cm[0], i, 0);
 
 			// copy activation to next layer
-			cudaMemcpyPeerAsync(layer[i + 1].a[layer[i].cur_fw_cm], i + 1, layer[i].a_next[layer[i].cur_fw_cm], i, num_node_arr[i + 1] * sizeof(double), stream[2 * i + 1]);
+			cudaMemcpyPeerAsync(layer[i + 1].a[layer[i].cur_fw_cm[0]], i + 1, layer[i].a_next[layer[i].cur_fw_cm[0]], i, num_node_arr[i + 1] * sizeof(double), stream[2 * i + 1]);
 
 			// next layer's forward input buffer is full
-			SetFlag<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i + 1].is_fw_input_ready, layer[i].cur_fw_cm);
+			SetFlag<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i + 1].is_fw_input_ready, layer[i].cur_fw_cm[0]);
 
 			// current layer's activation buffer is empty
-			SetFlag<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].is_fw_act_ready, layer[i].cur_fw_cm);
+			SetFlag<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].is_fw_output_ready, layer[i].cur_fw_cm[0]);
 
 			// buffer exchange
 			SetBuffer<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].cur_fw_cm);
+			PrintFw<<<1, 1, 0, stream[2 * i + 1]>>>(i, j);
+			printf("%d\n", i);
 		}
-
+		
+		/*
+		// Steady Stage -> 1B1F
 		for(int j = 0; j < i + 1; j++)
 		{	// backward X (layer_index + 1)
 			// wait for current layer's backward input buffer is full
-			WaituntilOne<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_bw_input_ready, layer[i].cur_bw_cp);
+			WaituntilOne<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_bw_input_ready, layer[i].cur_bw_cp[0]);
 
 			// wait for current layer's delta buffer is empty
-			WaituntilZero<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_bw_delta_ready, layer[i].cur_bw_cp);
+			WaituntilZero<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_bw_output_ready, layer[i].cur_bw_cp[0]);
 
 			// compute delta
-			MatrixMultiply(layer[i].weight, layer[i].delta_next[layer[i].cur_bw_cp] + sizeof(double), layer[i].delta[layer[i].cur_bw_cp], num_node_arr[i], num_node_arr[i + 1] - 1, 1, i);
+			MatrixMultiply(layer[i].weight, layer[i].delta_next[layer[i].cur_bw_cp[0]], layer[i].delta[layer[i].cur_bw_cp[0]], num_node_arr[i], num_node_arr[i + 1], 1, i);
 			//GetHiddenLayerDelta<<<(num_node_arr[i] + 1023) / 1024, 1024, 0, stream[i]>>>(layer[i].delta[j], layer[i].a[j], layer[i].weight[j], layer[i].delta_next[j], num_node_arr[i]);
 
 			// current layer's delta buffer is full
-			SetFlag<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_bw_delta_ready, layer[i].cur_bw_cp);
+			SetFlag<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_bw_output_ready, layer[i].cur_bw_cp[0]);
 
 			// update weight
-			UpdateWeight<<<(num_node_arr[i] * num_node_arr[i + 1] + 1023) / 1024, 1024, 0, stream[2 * i]>>>(layer[i].a[layer[i].cur_bw_cp], layer[i].weight, layer[i].delta_next[layer[i].cur_bw_cp], num_node_arr[i + 1], num_node_arr[i + 1] * num_node_arr[i], alpha);
+			UpdateWeight<<<(num_node_arr[i] * num_node_arr[i + 1] + 1023) / 1024, 1024, 0, stream[2 * i]>>>(layer[i].a[layer[i].cur_bw_cp[0]], layer[i].weight, layer[i].delta_next[layer[i].cur_bw_cp[0]], num_node_arr[i + 1], num_node_arr[i + 1] * num_node_arr[i], alpha);
 
 			// curren layer's backward input buffer is empty
-			SetFlag<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_bw_input_ready, layer[i].cur_bw_cp);
+			SetFlag<<<1, 1, 0, stream[2 * i]>>>(layer[i].is_bw_input_ready, layer[i].cur_bw_cp[0]);
 
 			//buffer exchange
 			SetBuffer<<<1, 1, 0, stream[2 * i]>>>(layer[i].cur_bw_cp);
 
 			// wait for current layer's delta buffer is full
-			WaituntilOne<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].is_bw_delta_ready, layer[i].cur_bw_cm);
+			WaituntilOne<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].is_bw_output_ready, layer[i].cur_bw_cm[0]);
 
 			// wait for previous layer's backward input buffer is empty
-			WaituntilZero<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i - 1].is_bw_input_ready, layer[i].cur_bw_cm);
+			WaituntilZero<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i - 1].is_bw_input_ready, layer[i].cur_bw_cm[0]);
 
 			// copy delta to preious layer
-			cudaMemcpyPeerAsync(layer[i - 1].delta_next[layer[i].cur_bw_cm], i - 1, layer[i].delta[layer[i].cur_bw_cm], i, num_node_arr[i - 1] * sizeof(double), stream[2 * i + 1]);
+			cudaMemcpyPeerAsync(layer[i - 1].delta_next[layer[i].cur_bw_cm[0]], i - 1, layer[i].delta[layer[i].cur_bw_cm[0]], i, num_node_arr[i - 1] * sizeof(double), stream[2 * i + 1]);
 
 			// previous backward input buffer is full
-			SetFlag<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i - 1].is_bw_input_ready, layer[i].cur_bw_cm);
+			SetFlag<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i - 1].is_bw_input_ready, layer[i].cur_bw_cm[0]);
 
 			// current layer's delta buffer is empty
-			SetFlag<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].is_bw_delta_ready, layer[i].cur_bw_cm);
+			SetFlag<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].is_bw_output_ready, layer[i].cur_bw_cm[0]);
 
 			// buffer exchange
 			SetBuffer<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].cur_bw_cm);
-		}	
+		}
+		*/	
 	}
 
-	///////////////////////////////////////////////////////////////////
-	// output layer ///////////////////////////////////////////////////
-	///////////////////////////////////////////////////////////////////
-
+	printf("2");
 	cudaSetDevice(num_layer - 1);
-	for(int j = 0; j < num_layer; j++)
-	{	// (Forward + Backward) X num_layer
+	for(int j = 0; j < num_data * epoch; j++)
+	{	// 1F1B
 		// wait for current layer's forward input buffer is full
-		WaituntilOne<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_fw_input_ready, layer[num_layer - 1].cur_fw_cp);
 		
+		WaituntilOne<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_fw_input_ready, layer[num_layer - 1].cur_fw_cp[0], num_layer - 1, 0);
+		
+		printf("2");
 		// softmax
-		Exponential<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[layer[num_layer - 1].cur_fw_cp], num_node_arr[num_layer - 1]);
-		cublasDasum(handle[num_layer - 1], num_node_arr[num_layer - 1], layer[num_layer - 1].a[layer[num_layer - 1].cur_fw_cp], 1, &sum[layer[num_layer - 1].cur_fw_cp]);
-		Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[layer[num_layer - 1].cur_fw_cp], sum[layer[num_layer - 1].cur_fw_cp], num_node_arr[num_layer - 1]);
-
-		// wait for current layer's delta buffer is empty
-		WaituntilZero<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_bw_delta_ready, layer[num_layer - 1].cur_bw_cp);
-
+		Exponential<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[layer[num_layer - 1].cur_fw_cp[0]], num_node_arr[num_layer - 1]);
+		printf("2");
+		// cublasDasum(handle[num_layer - 1], num_node_arr[num_layer - 1] - 1, layer[num_layer - 1].a[layer[num_layer - 1].cur_fw_cp[0]], 1, &sum[layer[num_layer - 1].cur_fw_cp[0]]);
+		printf("2");
+		Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[layer[num_layer - 1].cur_fw_cp[0]], sum[layer[num_layer - 1].cur_fw_cp[0]], num_node_arr[num_layer - 1]);
+		printf("2");
+		// wait for current layer's backward output buffer is empty
+		WaituntilZero<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_bw_output_ready, layer[num_layer - 1].cur_bw_cp[0], num_layer - 1, 0);
+		printf("2");
 		// compute delta
-		GetOutputLayerDelta<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[layer[num_layer - 1].cur_bw_cp], layer[num_layer - 1].delta[layer[num_layer - 1].cur_bw_cp], result_d + j, num_node_arr[num_layer - 1]);
-
-		// current layer's delta buffer is full
-		SetFlag<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_bw_delta_ready, layer[num_layer - 1].cur_bw_cp);
-
+		GetOutputLayerDelta<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[layer[num_layer - 1].cur_bw_cp[0]], layer[num_layer - 1].delta[layer[num_layer - 1].cur_bw_cp[0]], result_d + (j % num_data), num_node_arr[num_layer - 1]);
+		printf("2");
+		// current layer's backward output buffer is full
+		SetFlag<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_bw_output_ready, layer[num_layer - 1].cur_bw_cp[0]);
+		printf("2");
 		// current layer's forward input buffer is empty
-		SetFlag<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_fw_input_ready, layer[num_layer - 1].cur_fw_cp);
-
+		SetFlag<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_fw_input_ready, layer[num_layer - 1].cur_fw_cp[0]);
+		printf("2");
 		// buffer exchange
 		SetBuffer<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].cur_fw_cp);
 		SetBuffer<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].cur_bw_cp);
-
+		printf("2");
 		// wait for previous layer's backward input buffer is empty
-		WaituntilZero<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 2].is_bw_input_ready, layer[num_layer - 1].cur_bw_cm);
-
-		// wait for current layer's delta buffer is full
-		WaituntilOne<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 1].is_bw_delta_ready, layer[num_layer - 1].cur_bw_cm);
-
+		WaituntilZero<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 2].is_bw_input_ready, layer[num_layer - 1].cur_bw_cm[0], num_layer - 1, 1);
+		printf("2");
+		// wait for current layer's backward output buffer is full
+		WaituntilOne<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 1].is_bw_output_ready, layer[num_layer - 1].cur_bw_cm[0], num_layer - 1, 1);
+		printf("2");
 		// copy delta to previous layer
-		cudaMemcpyPeerAsync(layer[num_layer - 2].delta_next[layer[num_layer - 1].cur_bw_cm], num_layer - 2, layer[num_layer - 1].delta[layer[num_layer - 1].cur_bw_cm], num_layer - 1, num_node_arr[num_layer - 1] * sizeof(double), stream[2 * num_layer -1]);
-
+		cudaMemcpyPeerAsync(layer[num_layer - 2].delta_next[layer[num_layer - 1].cur_bw_cm[0]], num_layer - 2, layer[num_layer - 1].delta[layer[num_layer - 1].cur_bw_cm[0]], num_layer - 1, num_node_arr[num_layer - 1] * sizeof(double), stream[2 * num_layer -1]);
+		printf("2");
 		// previous layer's backward input buffer is full
-		SetFlag<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 2].is_bw_input_ready, layer[num_layer - 1].cur_bw_cm);
-
-		// current layer's delta buffer is empty
-		SetFlag<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 1].is_bw_delta_ready, layer[num_layer - 1].cur_bw_cm);
-
+		SetFlag<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 2].is_bw_input_ready, layer[num_layer - 1].cur_bw_cm[0]);
+		printf("2");
+		// current layer's backward output buffer is empty
+		SetFlag<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 1].is_bw_output_ready, layer[num_layer - 1].cur_bw_cm[0]);
+		printf("2");
 		// buffer exchange
 		SetBuffer<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 1].cur_bw_cm);
+		PrintFw<<<1, 1, 0, stream[2 * num_layer - 1]>>>(num_layer - 1, j % num_data);
+		PrintBw<<<1, 1, 0, stream[2 * num_layer - 1]>>>(num_layer - 1, j % num_data);
+		printf("2\n");
 	}
-
-	///////////////////////////////////////////////////////////////////
-	// steady stage ///////////////////////////////////////////////////
-	///////////////////////////////////////////////////////////////////
-
-	while(1)
-	{
-		// printf("\ninput index : %d, result index : %d\n", input_index, result_index);
-		if(input_index == num_data)
-			break;
-
-		// input layer
-		cudaSetDevice(0);
-		cudaMemcpyAsync(layer[0].a[cur_fw[0]], input_d + input_index++ * num_node_arr[0], num_node_arr[0] * sizeof(double), cudaMemcpyDeviceToDevice, stream[0]);
-		MatrixMultiply(layer[0].a[cur_fw[0]], layer[0].weight[cur_fw[0]], layer[0].a_next[cur_fw[0]], 1, num_node_arr[0], num_node_arr[1], 0);
-		Sigmoid<<<(num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a_next[cur_fw[0]], num_node_arr[1]);
-
-		WaituntilZero<<<1, 1, 0, stream[0]>>>(layer[1].fw_ready, cur_fw[0], 1, 1);
-
-		cudaMemcpyPeerAsync(layer[1].a[cur_fw[0]], 1, layer[0].a_next[cur_fw[0]], 0, num_node_arr[1] * sizeof(double), stream[0]);
-		cudaMemcpyPeerAsync(layer[1].fw_ready + cur_fw[0], 1, layer[0].index_arr + 1, 0, sizeof(int), stream[0]);
-
-		PrintFw<<<1, 1, 0, stream[0]>>>(0, cur_fw[0]);
-
-		if(cur_fw[0] == num_layer - 1)
-			cudaMemcpyAsync(cur_fw, layer[0].index_arr, sizeof(int), cudaMemcpyDeviceToHost, stream[0]);
-		else
-			cudaMemcpyAsync(cur_fw, layer[0].index_arr + cur_fw[0] + 1, sizeof(int), cudaMemcpyDeviceToHost, stream[0]);
-
-		WaituntilOne<<<1, 1, 0, stream[0]>>>(layer[0].bw_ready, cur_bw[0], 0, 0);
-
-		UpdateWeight<<<(num_node_arr[0] * num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a[cur_bw[0]], layer[0].weight[cur_bw[0]], layer[0].delta_next[cur_bw[0]], num_node_arr[1], num_node_arr[1] * num_node_arr[0], alpha);
-		cudaMemcpyAsync(layer[0].bw_ready + cur_bw[0], layer[0].index_arr, sizeof(int), cudaMemcpyDeviceToDevice, stream[0]);
-
-		PrintBw<<<1, 1, 0, stream[0]>>>(0, cur_bw[0]);
-
-		if(cur_bw[0] == num_layer - 1)
-			cudaMemcpyAsync(cur_bw, layer[0].index_arr, sizeof(int), cudaMemcpyDeviceToHost, stream[0]);
-		else
-			cudaMemcpyAsync(cur_bw, layer[0].index_arr + cur_bw[0] + 1, sizeof(int), cudaMemcpyDeviceToHost, stream[0]);
-
-		// hidden layer
-		for(int i = 1; i < num_layer - 1; i++)
-		{
-			cudaSetDevice(i);
-			WaituntilOne<<<1, 1, 0, stream[i]>>>(layer[i].fw_ready, cur_fw[i], i, 1);
-
-			MatrixMultiply(layer[i].a[cur_fw[i]], layer[i].weight[cur_fw[i]], layer[i].a_next[cur_fw[i]], 1, num_node_arr[i], num_node_arr[i + 1], i);
-			if(i != num_layer - 2)
-				Sigmoid<<<(num_node_arr[i + 1] + 1023) / 1024, 1024, 0, stream[i]>>>(layer[i].a_next[cur_fw[i]], num_node_arr[i + 1]);
-			
-			WaituntilZero<<<1, 1, 0, stream[i]>>>(layer[i + 1].fw_ready, cur_fw[i], i + 1, 1);
-
-			cudaMemcpyPeerAsync(layer[i + 1].a[cur_fw[i]], i + 1, layer[i].a_next[cur_fw[i]], i, num_node_arr[i + 1] * sizeof(double), stream[i]);
-			cudaMemcpyAsync(layer[i].fw_ready + cur_fw[i], layer[i].index_arr, sizeof(int), cudaMemcpyDeviceToDevice, stream[i]);
-			cudaMemcpyPeerAsync(layer[i + 1].fw_ready + cur_fw[i], i + 1, layer[i].index_arr + 1, i, sizeof(int), stream[i]);
-
-			PrintFw<<<1, 1, 0, stream[i]>>>(i, cur_fw[i]);
-
-			if(cur_fw[i] == num_layer - 1)
-				cudaMemcpyAsync(cur_fw + i, layer[i].index_arr, sizeof(int), cudaMemcpyDeviceToHost, stream[i]);
-			else
-				cudaMemcpyAsync(cur_fw + i, layer[i].index_arr + cur_fw[i] + 1, sizeof(int), cudaMemcpyDeviceToHost, stream[i]);
-		
-			WaituntilOne<<<1, 1, 0, stream[i]>>>(layer[i].bw_ready, cur_bw[i], i, 0);
-
-			MatrixMultiply(layer[i].weight[cur_bw[i]], layer[i].delta_next[cur_bw[i]], layer[i].delta[cur_bw[i]], num_node_arr[i], num_node_arr[i + 1], 1, i);
-			GetHiddenLayerDelta<<<(num_node_arr[i] + 1023) / 1024, 1024, 0, stream[i]>>>(layer[i].delta[cur_bw[i]], layer[i].a[cur_bw[i]], layer[i].weight[cur_bw[i]], layer[i].delta_next[cur_bw[i]], num_node_arr[i]);
-			WaituntilZero<<<1, 1, 0, stream[i]>>>(layer[i - 1].bw_ready, cur_bw[i], i - 1, 0);
-			
-			cudaMemcpyPeerAsync(layer[i - 1].delta_next[cur_bw[i]], i - 1, layer[i].delta[cur_bw[i]], i, num_node_arr[i - 1] * sizeof(double), stream[i]);
-			cudaMemcpyAsync(layer[i].bw_ready + cur_bw[i], layer[i].index_arr, sizeof(int), cudaMemcpyDeviceToDevice, stream[i]);
-			cudaMemcpyPeerAsync(layer[i - 1].bw_ready + cur_bw[i], i - 1, layer[i].index_arr + 1, i, sizeof(int), stream[i]);
-
-			PrintBw<<<1, 1, 0, stream[i]>>>(i, cur_bw[i]);
-
-			if(cur_bw[i] == num_layer - 1)
-				cudaMemcpyAsync(cur_bw + i, layer[i].index_arr, sizeof(int), cudaMemcpyDeviceToHost, stream[i]);
-			else
-				cudaMemcpyAsync(cur_bw + i, layer[i].index_arr + cur_bw[i] + 1, sizeof(int), cudaMemcpyDeviceToHost, stream[i]);
-		}
-
-		// output layer
-		cudaSetDevice(num_layer - 1);
-
-		WaituntilOne<<<1, 1, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].fw_ready, cur_fw[num_layer - 1], num_layer - 1, 1);
-
-		Exponential<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].a[cur_fw[num_layer - 1]], num_node_arr[num_layer - 1]);
-		cublasDasum(handle[num_layer - 1], num_node_arr[num_layer - 1], layer[num_layer - 1].a[cur_fw[num_layer - 1]], 1, &sum);
-		Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].a[cur_fw[num_layer - 1]], sum, num_node_arr[num_layer - 1]);
-
-		PrintFw<<<1, 1, 0, stream[num_layer - 1]>>>(num_layer - 1, cur_fw[num_layer - 1]);
-
-		GetOutputLayerDelta<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[num_layer - 1]>>>(layer[num_layer - 1].a[cur_fw[num_layer - 1]], layer[num_layer - 1].delta[cur_bw[num_layer - 1]], result_d + result_index++, num_node_arr[num_layer - 1]);
-
-		WaituntilZero<<<1, 1, 0, stream[num_layer - 1]>>>(layer[num_layer - 2].bw_ready, cur_fw[num_layer - 1], num_layer - 2, 0);
-
-		cudaMemcpyPeerAsync(layer[num_layer - 2].delta_next[cur_fw[num_layer - 1]], num_layer - 2, layer[num_layer - 1].delta[cur_fw[num_layer - 1]], num_layer - 1, num_node_arr[num_layer - 1] * sizeof(double), stream[num_layer - 1]);
-		cudaMemcpyAsync(layer[num_layer - 1].fw_ready + cur_fw[num_layer - 1], layer[num_layer - 1].index_arr, sizeof(int), cudaMemcpyDeviceToDevice, stream[num_layer - 1]);
-		cudaMemcpyPeerAsync(layer[num_layer - 2].bw_ready + cur_fw[num_layer - 1], num_layer - 2, layer[num_layer - 1].index_arr + 1, num_layer - 1, sizeof(int), stream[num_layer - 1]);
-
-		PrintBw<<<1, 1, 0, stream[num_layer - 1]>>>(num_layer - 1, cur_fw[num_layer - 1]);
-
-		if(cur_fw[num_layer - 1] == num_layer - 1)
-			cudaMemcpyAsync(cur_fw + num_layer - 1, layer[num_layer - 1].index_arr, sizeof(int), cudaMemcpyDeviceToHost, stream[num_layer - 1]);
-		else				
-			cudaMemcpyAsync(cur_fw + num_layer - 1, layer[num_layer - 1].index_arr + cur_fw[num_layer - 1] + 1, sizeof(int), cudaMemcpyDeviceToHost, stream[num_layer - 1]);
-	}
-
-	
 }
 
 /*
@@ -581,6 +475,7 @@ void test_accuracy()
 	printf("%lf%%\n", correct / num_test_examples * 100);
 	return;
 }*/
+
 
 void MatrixMultiply(double *d_A, double *d_B, double *d_C, int A_H, int A_W, int B_W, int i)
 {
@@ -658,44 +553,33 @@ __global__ void Printint(int *a, int device, int size)
 
 __global__ void PrintFw(int device, int index)
 {
-	printf("device : %d , fw : %d\n", device, index);
+	printf("device #%d , fw -> %d\n", device, index);
 }
 
 __global__ void PrintBw(int device, int index)
 {
-	printf("device : %d , bw : %d\n", device, index);
+	printf("device #%d , bw <- %d\n", device, index);
 }
 
-__global__ void WaituntilZero(int *ready, int index)
+__global__ void WaituntilZero(int *ready, int index, int device, int flag)
 {
-	while(ready[index] == 1) {
-		// for(int i = 0; i < 100; i++)
-		// { }
-		/*
-		printf("device : %d, ", device);
-		if(fb == 1)
-			printf("direction : fw, ");
-		else
-			printf("direction : bw, ");
-		printf("%d\n", ready[index]);
-		*/
+	while(ready[index] == 1)
+	{
+		// if(flag == 0)
+		// 	printf("device #%d , fw WaituntilZero\n", device);
+		// else
+		// 	printf("device #%d , bw WaituntilZero\n", device);
 	}
 }
 
-__global__ void WaituntilOne(int *ready, int index)
+__global__ void WaituntilOne(int *ready, int index, int device, int flag)
 {
-	
-	while(ready[index] == 0) { 
-		// for(int i = 0; i < 10000000; i++)
-		// { }
-		/*
-		printf("device : %d, ", device);
-		if(fb == 1)
-			printf("direction : fw, ");
-		else
-			printf("direction : bw, ");
-		printf("%d\n", ready[index]);
-		*/
+	while(ready[index] == 0)
+	{
+		// if(flag == 0)
+		// 	printf("device #%d , fw WaituntilOne\n", device);
+		// else
+		// 	printf("device #%d , bw WaituntilOne\n", device);
 	}
 }
 
@@ -706,10 +590,5 @@ __global__ void SetFlag(int *ready, int index)
 
 __global__ void SetBuffer(int *index)
 {
-	index = 1 - index;
-}
-
-__global__ void dummy()
-{
-	while(1) { }
+	index[0] = 1 - index[0];
 }
