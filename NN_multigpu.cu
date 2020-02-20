@@ -6,10 +6,8 @@
 
 #define alpha 0.001
 
-__global__ void Print(double *a, int size);
-__global__ void Printint(int *a, int device, int size);
-__global__ void PrintBw(int device, int index);
-__global__ void PrintFw(int device, int index);
+__global__ void PrintInt(int *flag, int index, int size, int line);
+__global__ void PrintDouble(double *flag, int index, int size, int line);
 
 __global__ void SetResult(double *result_d, int correct_result, int size);
 __global__ void GetOutputLayerDelta(double *output_a, double *output_delta, double *result, int size);
@@ -18,9 +16,9 @@ __global__ void UpdateWeight(double *cur_a, double *cur_weight, double *next_del
 __global__ void Sigmoid(double *a, int size);
 __global__ void Exponential(double *a, int size);
 __global__ void Softmax(double *a, double sum, int size);
-__global__ void WaituntilZero(int *ready, int index, int device, int flag);
-__global__ void WaituntilOne(int *ready, int index, int device, int flag);
-__global__ void SetFlag(int *ready, int index);
+__global__ void WaituntilZero(int *ready, int *index, int device, int flag);
+__global__ void WaituntilOne(int *ready, int *index, int device, int flag);
+__global__ void SetFlag(int *ready, int *index);
 __global__ void SetBuffer(int *index);
 
 void MatrixMultiply(double *d_A, double *d_B, double *d_C, int A_H, int A_W, int B_W, int i);
@@ -124,7 +122,8 @@ void SetLayer(int layer_index)
 
 	cudaMallocManaged((void**) &layer[layer_index].is_fw_output_ready, 2 * sizeof(int));
 	cudaMallocManaged((void**) &layer[layer_index].is_bw_output_ready, 2 * sizeof(int));
-	layer[layer_index].is_fw_output_ready[0] = layer[layer_index].is_fw_output_ready[1] = 0;
+	layer[layer_index].is_fw_output_ready[0] = 0;
+	layer[layer_index].is_fw_output_ready[1] = 0;
 	layer[layer_index].is_bw_output_ready[0] = layer[layer_index].is_bw_output_ready[0] = 0;
 
 	cudaMallocManaged((void**) &layer[layer_index].is_fw_input_ready, 2 * sizeof(int));
@@ -228,40 +227,40 @@ void train_model()
 	for(int j = 0; j < 2 * num_layer - 1; j++)
 	{	// Start Stage = (2 * num_layer - 1) X Forward
 		// copy input data
-		cudaMemcpyAsync(layer[0].a[layer[0].cur_fw_cp[0]], input_d + j * num_node_arr[0], num_node_arr[0] * sizeof(double), cudaMemcpyDeviceToDevice, stream[0]);
+		PrintInt<<<1, 1, 0, stream[0]>>>(layer[0].cur_fw_cp, 0, 1, __LINE__);
+		cudaMemcpyAsync(layer[0].a[layer[0].cur_fw_cp[0]], input_d + (j * num_node_arr[0]) * sizeof(int), num_node_arr[0] * sizeof(double), cudaMemcpyDeviceToDevice, stream[0]);
+		PrintDouble<<<1, 1, 0, stream[0]>>>(layer[0].a[0], 300, 100, __LINE__);
 
 		// wait for current layer's activation buffer is empty
-		WaituntilZero<<<1, 1, 0, stream[0]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cp[0], 0, 0);
+		WaituntilZero<<<1, 1, 0, stream[0]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cp, 0, 0);
 		
 		// compute activation
 		MatrixMultiply(layer[0].a[layer[0].cur_fw_cp[0]], layer[0].weight, layer[0].a_next[layer[0].cur_fw_cp[0]], 1, num_node_arr[0], num_node_arr[1], 0);
 		Sigmoid<<<(num_node_arr[1] + 1023) / 1024, 1024, 0, stream[0]>>>(layer[0].a_next[layer[0].cur_fw_cp[0]], num_node_arr[1]);
 		
 		// current layer's activation buffer is full
-		SetFlag<<<1, 1, 0, stream[0]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cp[0]);
+		SetFlag<<<1, 1, 0, stream[0]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cp);
 		
 		// buffer exchange
 		SetBuffer<<<1, 1, 0, stream[0]>>>(layer[0].cur_fw_cp);
 
 		// wait for current layer's activation buffer is full
-		WaituntilOne<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cm[0], 0, 0);
+		WaituntilOne<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cm, 0, 0);
 		
 		// wait for next layer's forward input buffer is empty
-		WaituntilZero<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, layer[0].cur_fw_cm[0], 0, 0);
+		WaituntilZero<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, layer[0].cur_fw_cm, 0, 0);
 		
 		// copy activation to next layer
 		cudaMemcpyPeerAsync(layer[1].a[layer[0].cur_fw_cm[0]], 1, layer[0].a_next[layer[0].cur_fw_cm[0]], 0, num_node_arr[1] * sizeof(double), stream[1]);
 		
 		// next layer's forward input buffer is full
-		SetFlag<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, layer[0].cur_fw_cm[0]);
+		SetFlag<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, layer[0].cur_fw_cm);
 		
 		// current layer's activation buffer is empty
-		SetFlag<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cm[0]);
+		SetFlag<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_output_ready, layer[0].cur_fw_cm);
 
 		// buffer exchange
 		SetBuffer<<<1, 1, 0, stream[1]>>>(layer[0].cur_fw_cm);
-		PrintFw<<<1, 1, 0, stream[1]>>>(0, j);
-		printf("0\n");
 	}
 
 	// Steady Stage = 1B1F
@@ -269,7 +268,7 @@ void train_model()
 	///////////////////////////////////////////////////////////////////
 	// hidden layer ///////////////////////////////////////////////////
 	///////////////////////////////////////////////////////////////////
-
+	/*
 	for(int i = 1; i < num_layer - 1; i++)
 	{
 		cudaSetDevice(i);
@@ -312,11 +311,8 @@ void train_model()
 
 			// buffer exchange
 			SetBuffer<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].cur_fw_cm);
-			PrintFw<<<1, 1, 0, stream[2 * i + 1]>>>(i, j);
-			printf("%d\n", i);
 		}
 		
-		/*
 		// Steady Stage -> 1B1F
 		for(int j = 0; j < i + 1; j++)
 		{	// backward X (layer_index + 1)
@@ -360,9 +356,8 @@ void train_model()
 			// buffer exchange
 			SetBuffer<<<1, 1, 0, stream[2 * i + 1]>>>(layer[i].cur_bw_cm);
 		}
-		*/	
-	}
-
+	}*/
+/*
 	printf("2");
 	cudaSetDevice(num_layer - 1);
 	for(int j = 0; j < num_data * epoch; j++)
@@ -377,7 +372,7 @@ void train_model()
 		printf("2");
 		// cublasDasum(handle[num_layer - 1], num_node_arr[num_layer - 1] - 1, layer[num_layer - 1].a[layer[num_layer - 1].cur_fw_cp[0]], 1, &sum[layer[num_layer - 1].cur_fw_cp[0]]);
 		printf("2");
-		Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[layer[num_layer - 1].cur_fw_cp[0]], sum[layer[num_layer - 1].cur_fw_cp[0]], num_node_arr[num_layer - 1]);
+		// Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[layer[num_layer - 1].cur_fw_cp[0]], sum[layer[num_layer - 1].cur_fw_cp[0]], num_node_arr[num_layer - 1]);
 		printf("2");
 		// wait for current layer's backward output buffer is empty
 		WaituntilZero<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_bw_output_ready, layer[num_layer - 1].cur_bw_cp[0], num_layer - 1, 0);
@@ -412,10 +407,9 @@ void train_model()
 		printf("2");
 		// buffer exchange
 		SetBuffer<<<1, 1, 0, stream[2 * num_layer - 1]>>>(layer[num_layer - 1].cur_bw_cm);
-		PrintFw<<<1, 1, 0, stream[2 * num_layer - 1]>>>(num_layer - 1, j % num_data);
-		PrintBw<<<1, 1, 0, stream[2 * num_layer - 1]>>>(num_layer - 1, j % num_data);
 		printf("2\n");
 	}
+	*/
 }
 
 /*
@@ -536,59 +530,43 @@ __global__ void Softmax(double *a, double sum, int size)
 		a[i] /= sum;
 }
 
-__global__ void Print(double *a, int size)
+__global__ void WaituntilZero(int *ready, int *index, int device, int flag)
 {
-	for(int i=0; i<size; i++)
-		printf(" %lf /", a[i]);
-	printf("\n");
-}
-
-__global__ void Printint(int *a, int device, int size)
-{
-	printf("device : %d , ", device);
-	for(int i=0; i<size; i++)
-		printf(" %d /", a[i]);
-	printf("\n");
-}
-
-__global__ void PrintFw(int device, int index)
-{
-	printf("device #%d , fw -> %d\n", device, index);
-}
-
-__global__ void PrintBw(int device, int index)
-{
-	printf("device #%d , bw <- %d\n", device, index);
-}
-
-__global__ void WaituntilZero(int *ready, int index, int device, int flag)
-{
-	while(ready[index] == 1)
+	while(ready[index[0]] == 1)
 	{
-		// if(flag == 0)
-		// 	printf("device #%d , fw WaituntilZero\n", device);
-		// else
-		// 	printf("device #%d , bw WaituntilZero\n", device);
 	}
 }
 
-__global__ void WaituntilOne(int *ready, int index, int device, int flag)
+__global__ void WaituntilOne(int *ready, int *index, int device, int flag)
 {
-	while(ready[index] == 0)
+	while(ready[index[0]] == 0)
 	{
-		// if(flag == 0)
-		// 	printf("device #%d , fw WaituntilOne\n", device);
-		// else
-		// 	printf("device #%d , bw WaituntilOne\n", device);
 	}
 }
 
-__global__ void SetFlag(int *ready, int index)
+__global__ void SetFlag(int *ready, int *index)
 {
-	ready[index] = 1 - ready[index];
+	ready[index[0]] = 1 - ready[index[0]];
 }
 
 __global__ void SetBuffer(int *index)
 {
 	index[0] = 1 - index[0];
+	// printf("0\n");
+}
+
+__global__ void PrintInt(int *flag, int index, int size, int line)
+{
+	printf("line #%d\t", line);
+	for(int i = 0; i < size; i++)
+		printf("%d ", flag[index + i]);
+	printf("\n");
+}
+
+__global__ void PrintDouble(double *flag, int index, int size, int line)
+{
+	printf("line #%d\t", line);
+	for(int i = 0; i < size; i++)
+		printf("%lf ", flag[index + i]);
+	printf("\n");
 }
