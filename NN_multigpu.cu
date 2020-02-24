@@ -48,6 +48,7 @@ struct layer_info {
 	int *is_bw_input_ready;
 	int *is_fw_output_ready;
 	int *is_bw_output_ready;
+	int *is_fw_next_input_ready;
 };
 
 struct layer_info *layer;
@@ -156,6 +157,9 @@ void SetLayer(int layer_index)
 	cudaMallocManaged((void**) &layer[layer_index].is_bw_input_ready, 2 * sizeof(int));
 	layer[layer_index].is_fw_input_ready[0] = layer[layer_index].is_fw_input_ready[1] = 0;
 	layer[layer_index].is_bw_input_ready[0] = layer[layer_index].is_bw_input_ready[1] = 0;
+
+	cudaMallocManaged((void**) &layer[layer_index].is_fw_next_input_ready, 2 * sizeof(int));
+	layer[layer_index].is_fw_next_input_ready[0] = layer[layer_index].is_fw_next_input_ready[1] = 0;
 	
 	layer[layer_index].a = (double **)malloc(2 * sizeof(double *));
 	for(int i = 0; i < 2; i++)
@@ -245,7 +249,7 @@ void train_model()
 	{
 		if(i == 0)
 		{
-			while(cur_fw[0] < 1)
+			while(cur_fw[0] < 3)
 			// while(cur_fw[0] < 2 * (num_layer - 1))
 			{
 				InputForwardComputation(cur_fw[0]);
@@ -254,11 +258,12 @@ void train_model()
 		}
 		else
 		{
+			while(cur_fw[i] < 2)
 			// while(cur_fw[i]++ < 2 * (num_layer  - 1 - i))
-			// {
-			// 	HiddenForwardComputation(i, cur_fw[i]);
-			// 	HiddenForwardCommunication(i, cur_fw[i]);
-			// }
+			{
+				HiddenForwardComputation(i, cur_fw[i]);
+				HiddenForwardCommunication(i, cur_fw[i]++);
+			}
 		}
 	}
 
@@ -266,7 +271,7 @@ void train_model()
 	{
 		if(i == num_layer - 1)
 		{
-
+			
 		}
 		else
 		{
@@ -529,14 +534,15 @@ void InputForwardCommunication(int index)
 	WaituntilOne<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_output_ready, buffer, __LINE__, index);
 	
 	// wait for next layer's forward input buffer is empty
-	WaituntilZero<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, buffer, __LINE__, index);
+	WaituntilZero<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_next_input_ready, buffer, __LINE__, index);
 
 	// copy activation to next layer
 	cudaMemcpyPeerAsync(layer[1].a[buffer], 1, layer[0].a_next[buffer], 0, num_node_arr[1] * sizeof(double), stream[1]);
 	
 	// next layer's forward input buffer is full
 	SetFlag<<<1, 1, 0, stream[1]>>>(layer[1].is_fw_input_ready, buffer);
-	
+	SetFlag<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_next_input_ready, buffer);
+
 	// current layer's activation buffer is empty
 	SetFlag<<<1, 1, 0, stream[1]>>>(layer[0].is_fw_output_ready, buffer);
 	// PrintFw<<<1, 1, 0, stream[1]>>>(0, index);
@@ -563,6 +569,7 @@ void HiddenForwardComputation(int device, int index)
 
 	// current layer's forward input buffer is empty
 	SetFlag<<<1, 1, 0, stream[2 * device]>>>(layer[device].is_fw_input_ready, buffer);
+	SetFlag<<<1, 1, 0, stream[2 * device]>>>(layer[device - 1].is_fw_next_input_ready, buffer);
 }
 
 void HiddenForwardCommunication(int device, int index)
@@ -574,13 +581,14 @@ void HiddenForwardCommunication(int device, int index)
 	WaituntilOne<<<1, 1, 0, stream[2 * device + 1]>>>(layer[device].is_fw_output_ready, buffer, __LINE__, index);
 				
 	// wait for next layer's forward input buffer is empty
-	WaituntilZero<<<1, 1, 0, stream[2 * device + 1]>>>(layer[device + 1].is_fw_input_ready, buffer, __LINE__, index);
+	WaituntilZero<<<1, 1, 0, stream[2 * device + 1]>>>(layer[device].is_fw_next_input_ready, buffer, __LINE__, index);
 
 	// copy activation to next layer
 	cudaMemcpyPeerAsync(layer[device + 1].a[buffer], device + 1, layer[device].a_next[buffer], device, num_node_arr[device + 1] * sizeof(double), stream[2 * device + 1]);
 
 	// next layer's forward input buffer is full
 	SetFlag<<<1, 1, 0, stream[2 * device + 1]>>>(layer[device + 1].is_fw_input_ready, buffer);
+	SetFlag<<<1, 1, 0, stream[2 * device + 1]>>>(layer[device].is_fw_next_input_ready, buffer);
 
 	// current layer's activation buffer is empty
 	SetFlag<<<1, 1, 0, stream[2 * device + 1]>>>(layer[device].is_fw_output_ready, buffer);
@@ -639,28 +647,24 @@ __global__ void Softmax(double *a, double sum, int size)
 
 __global__ void WaituntilZero(int *ready, int index, int line, int x)
 {
-	int i = 0;
 	while(ready[index] == 1)
 	{
-		// i *= 0;
 		// printf("%d\t%d\n", line, x);
 	}
 }
 
 __global__ void WaituntilOne(int *ready, int index, int line, int x)
 {
-	int i = 0;
 	while(ready[index] == 0)
 	{
-		// i *= 0;
 		// printf("%d\t%d\n", line, index);
 	}
 }
 
 __global__ void SetFlag(int *ready, int index)
 {
-	atomicXor(ready + index * sizeof(int), 1);
-	// ready[index] = 1 - ready[index];
+	// atomicXor(ready + index * sizeof(int), 1);
+	ready[index] = 1 - ready[index];
 }
 
 __global__ void PrintFw(int device, int index)
