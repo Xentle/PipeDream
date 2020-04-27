@@ -303,8 +303,43 @@ void train_model()
 		cudaSetDevice(i);
 		cudaDeviceSynchronize();
 	}
+	
+	// steady stage		if (data 개수 홀수) : epoch 홀수 / 짝수일 때 시작 buffer 다른 것 사용하기 
+	while(e[0] < epoch)
+	{
+		for(int i = 0; i < num_layer; i++)
+		{
+			if(i == 0)
+			{
+				InputForwardBackwardComputation(cur_fw[i], cur_bw[i]++, e[i]);
+				InputForwardCommunication(cur_fw[i]++, e[i]);
+			}
+			else if(i == num_layer - 1)
+			{
+				OutputForwardBackwardComputation(cur_fw[i], cur_bw[i], e[i]);
+				OutputForwardBackwardCommunication(cur_fw[i]++, cur_bw[i]++, e[i]);
+			}
+			else
+			{
+				HiddenForwardBackwardComputation(i, cur_fw[i], cur_bw[i], e[i]);
+				HiddenForwardBackwardCommunication(i, cur_fw[i]++, cur_bw[i]++, e[i]);
+			}
+		}
+
+		for(int i = 0; i < num_layer; i++)
+		{
+			if(cur_fw[i] == num_data)
+				cur_fw[i] = 0;
+			if(cur_bw[i] == num_data)
+			{
+				cur_bw[i] = 0;
+				e[i]++;
+			}
+		}
+	}
 
 //	print device flag
+//	for(int i = 0; i < num_layer; i++)
 //	{
 //		cudaSetDevice(i);
 //		PrintInt<<<1, 1>>>(layer[i].is_fw_input_ready, 0, __LINE__);
@@ -325,62 +360,9 @@ void train_model()
 //		PrintInt<<<1, 1>>>(layer[i].is_bw_prev_input_ready, 0, __LINE__);
 //		PrintInt<<<1, 1>>>(layer[i].is_bw_prev_input_ready, 1, __LINE__);
 //		PrintEnter<<<1, 1>>>();
-//	}
-
-	
-	// steady stage		if (data 개수 홀수) : epoch 홀수 / 짝수일 때 시작 buffer 다른 것 사용하기 
-	while(e[0] < epoch)
-	{
-		for(int i = 0; i < num_layer; i++)
-		{
-			if(i == 0)
-			{
-				// printf("device: %d\tepoch: %d\tfw: %d, bw: %d\n", i, e[i], cur_fw[i], cur_bw[i]);
-				InputForwardBackwardComputation(cur_fw[i], cur_bw[i]++, e[i]);
-				InputForwardCommunication(cur_fw[i]++, e[i]);
-			}
-			else if(i == num_layer - 1)
-			{
-				// printf("device: %d\tepoch: %d\tfw: %d, bw: %d\n", i, e[i], cur_fw[i], cur_bw[i]);
-				OutputForwardBackwardComputation(cur_fw[i], cur_bw[i], e[i]);
-				OutputForwardBackwardCommunication(cur_fw[i]++, cur_bw[i]++, e[i]);
-			}
-			else
-			{
-				// printf("device: %d\tepoch: %d\tfw: %d, bw: %d\n", i, e[i], cur_fw[i], cur_bw[i]);
-				HiddenForwardBackwardComputation(i, cur_fw[i], cur_bw[i], e[i]);
-				HiddenForwardBackwardCommunication(i, cur_fw[i]++, cur_bw[i]++, e[i]);
-			}
-		}
-
-		for(int i = 0; i < num_layer; i++)
-		{
-			if(cur_fw[i] == num_data)
-				cur_fw[i] = 0;
-			if(cur_bw[i] == num_data)
-			{
-				cur_bw[i] = 0;
-				e[i]++;
-			}
-		}
-
-		for(int i = 0; i < num_layer; i++)
-		{
-			cudaSetDevice(i);
-			cudaDeviceSynchronize();
-		}
-	}
-
-	// printf("device: %d\tepoch: %d\tfw: %d, bw: %d\n", 0, e[0], cur_fw[0], cur_bw[0]);
-//	InputForwardBackwardComputation(cur_fw[0], cur_bw[0]++, e[0]);
-//	InputForwardCommunication(cur_fw[0]++, e[0]);
 //
-//	InputForwardBackwardComputation(cur_fw[0], cur_bw[0]++, e[0]);
-//	InputForwardCommunication(cur_fw[0]++, e[0]);
-
-	// printf("device: %d\tepoch: %d\tfw: %d, bw: %d\n", 1, e[1], cur_fw[1], cur_bw[1]);
-	// HiddenForwardBackwardComputation(1, cur_fw[1], cur_bw[1], e[1]);
-	// HiddenForwardBackwardCommunication(1, cur_fw[1]++, cur_bw[1]++, e[1]);
+//		cudaDeviceSynchronize();
+//	}
 
 	/*
 	// end stage
@@ -539,7 +521,7 @@ void InputForwardBackwardComputation(int fw_index, int bw_index, int e)
 	
 	// current layer's forward output buffer is full
 	cudaMemsetAsync(&layer[0].is_fw_output_ready[fw_buffer], 1, sizeof(int), stream[0]);
-	// PrintFw<<<1, 1, 0, stream[0]>>>(0, fw_index, e);
+	PrintFw<<<1, 1, 0, stream[0]>>>(0, fw_index, e);
 
 	// wait for current layer's backward input buffer is full
 	WaituntilOne<<<1, 1, 0, stream[0]>>>(layer[0].is_bw_input_ready, bw_buffer, __LINE__, bw_index, e, 0);
@@ -550,7 +532,7 @@ void InputForwardBackwardComputation(int fw_index, int bw_index, int e)
 	// current layer's backward input buffer is empty
 	cudaMemsetAsync(&layer[0].is_bw_input_ready[bw_buffer], 0, sizeof(int), stream[0]);
 	cudaMemcpyPeerAsync(&layer[1].is_bw_prev_input_ready[bw_buffer], 1, &layer[0].is_bw_input_ready[bw_buffer], 0, sizeof(int), stream[0]);
-	// PrintBw<<<1, 1, 0, stream[0]>>>(0, bw_index, e);
+	PrintBw<<<1, 1, 0, stream[0]>>>(0, bw_index, e);
 }
 
 void HiddenForwardComputation(int device, int index)
@@ -618,8 +600,8 @@ void HiddenForwardBackwardComputation(int device, int fw_index, int bw_index, in
 
 	// current layer's forward output buffer is full
 	cudaMemsetAsync(&layer[device].is_fw_output_ready[fw_buffer], 1, sizeof(int), stream[2 * device]);
-	if(device == 1)
-		PrintFw<<<1, 1, 0, stream[2 * device]>>>(device, fw_index, e);
+//	if(device == 1)
+//		PrintFw<<<1, 1, 0, stream[2 * device]>>>(device, fw_index, e);
 
 	// wait for current layer's backward input buffer is full
 	WaituntilOne<<<1, 1, 0, stream[2 * device]>>>(layer[device].is_bw_input_ready, bw_buffer, __LINE__, bw_index, e, device);
@@ -642,8 +624,8 @@ void HiddenForwardBackwardComputation(int device, int fw_index, int bw_index, in
 	cudaMemsetAsync(&layer[device].is_bw_input_ready[bw_buffer], 0, sizeof(int), stream[2 * device]);
 	cudaMemcpyPeerAsync(&layer[device - 1].is_fw_next_input_ready[fw_buffer], device - 1, &layer[device].is_fw_input_ready[fw_buffer], device, sizeof(int), stream[2 * device]);
 	cudaMemcpyPeerAsync(&layer[device + 1].is_bw_prev_input_ready[bw_buffer], device + 1, &layer[device].is_bw_input_ready[bw_buffer], device, sizeof(int), stream[2 * device]);
-	if(device == 1)
-		PrintBw<<<1, 1, 0, stream[2 * device]>>>(device, bw_index, e);
+//	if(device == 1)
+//		PrintBw<<<1, 1, 0, stream[2 * device]>>>(device, bw_index, e);
 }
 
 void HiddenForwardBackwardCommunication(int device, int fw_index, int bw_index, int e)
@@ -788,7 +770,7 @@ __global__ void Softmax(double *a, double sum, int size)
 
 __global__ void WaituntilZero(int *ready, int index, int line, int x, int e, int d)
 {
-	while(ready[index] == 1)
+	while(ready[index] != 0)
 	{
 		// printf("line: %d\tindex: %d\tepoch: %d\tdevice: %d\n", line, x, e, e);
 	}
