@@ -7,11 +7,10 @@
 #define alpha 0.001
 
 // Debug
-__global__ void PrintInt(int *flag, int index, int line);
-__global__ void PrintDouble(double *flag, int index, int size, int line);
+__global__ void PrintInt(int *arr, int size);
+__global__ void PrintDouble(double *arr, int size);
 __global__ void PrintFw(int device, int index, int e);
 __global__ void PrintBw(int device, int index, int e);
-__global__ void PrintEnter();
 
 // Computation
 __global__ void GetOutputLayerDelta(double *output_a, double *output_delta, double *result, int index, int size);
@@ -19,7 +18,10 @@ __global__ void GetHiddenLayerDelta(double *cur_delta, double *cur_a, double *cu
 __global__ void UpdateWeight(double *cur_a, double *cur_weight, double *next_delta, int W_W, int size, double lr);
 __global__ void Sigmoid(double *a, int size);
 __global__ void Exponential(double *a, int size);
-__global__ void Softmax(double *a, double sum, int size);
+__global__ void Softmax(double *a, double* sum, int size);
+__global__ void CheckCorrect(double *test_result_d, int fw_index, int *max_index, double *num_correct);
+__global__ void GetMaxIndex(double *a, int num_node, int *index);
+__global__ void GetSum(double *a, int num_node, double *s);
 void MatrixMultiply(double *d_A, double *d_B, double *d_C, int A_H, int A_W, int B_W, int i);
 
 // Scheduling
@@ -28,9 +30,9 @@ void InputForwardCommunication(int index, int e);
 void HiddenForwardComputation(int device, int index);
 void HiddenForwardCommunication(int device, int index);
 void InputForwardBackwardComputation(int fw_index, int bw_index, int e);
-void InputForwardBackwardCommunication(int fw_index, int bw_index, int e);
 void HiddenForwardBackwardComputation(int device, int fw_index, int bw_index, int e);
 void HiddenForwardBackwardCommunication(int device, int fw_index, int bw_index, int e);
+void OutputForwardComputation(int fw_index);
 void OutputForwardBackwardComputation(int fw_index, int bw_index, int e);
 void OutputForwardBackwardCommunication(int fw_index, int bw_index, int e);
 
@@ -66,9 +68,11 @@ cublasHandle_t *handle;
 cudaStream_t *stream;
 
 double *input_d, *input_host, *result_d, *result_host, *sum;
-int *num_node_arr, *cur_fw, *cur_bw, *e;
+double *test_input_d, *test_input_host, *test_result_d, *test_result_host, *d_num_correct;
+int *num_node_arr, *cur_fw, *cur_bw, *e, *max_index, *d_max_index;
 
-int num_layer = 0, num_data = 0, epoch = 0;
+int num_layer = 0, num_data = 0, epoch = 0, test_num_data = 0;
+double num_correct = 0;
 
 clock_t start;
 
@@ -90,6 +94,9 @@ int main() {
 
 	printf("epoch : ");
 	scanf(" %d", &epoch);
+
+	printf("number of test data : ");
+	scanf(" %d", &test_num_data);
 	
 	// make tool
 	handle = (cublasHandle_t *)malloc(num_layer * sizeof(cublasHandle_t));
@@ -103,9 +110,6 @@ int main() {
 	e = (int *)malloc(num_layer * sizeof(int));
 	for(int i = 0; i < num_layer; i++)
 		e[i] = 0;
-
-	sum = (double *)malloc(2 * sizeof(double));
-	sum[0] = sum[1] = 0;
 
 	// build model
 	GetResultAndInput();
@@ -133,6 +137,15 @@ int main() {
 	
 	// train and test
 	train_model();
+
+	for(int i = 0; i < num_layer; i++)
+	{
+		cudaSetDevice(i);
+		cudaDeviceSynchronize();
+	}
+
+	// test accuracy
+	test_accuracy();
 
 	for(int i = 0; i < num_layer; i++)
 	{
@@ -242,8 +255,12 @@ void GetResultAndInput()
         }       
 	}
 	cudaSetDevice(num_layer - 1);
-	cudaMalloc((void**) &result_d, num_data * sizeof(int));
-	cudaMemcpy(result_d, result_host, num_data * sizeof(int), cudaMemcpyHostToDevice);
+	cudaMalloc((void**) &result_d, num_data * sizeof(double));
+	cudaMemcpy(result_d, result_host, num_data * sizeof(double), cudaMemcpyHostToDevice);
+	cudaMalloc((void**) &sum, sizeof(double));
+
+	cudaMalloc((void**) &d_num_correct, sizeof(double)); cudaMemset(&d_num_correct, 0, sizeof(double));
+	cudaMalloc((void**) &d_max_index, sizeof(int)); max_index = (int *)malloc(sizeof(int));
 
 	cudaSetDevice(0);
 	cudaMalloc((void**) &input_d, num_data * num_node_arr[0] * sizeof(double));
@@ -274,8 +291,6 @@ void train_model()
 			}
 		}
 	}
-
-	
 	for(int i = 1; i < num_layer; i++)
 	{
 		if(i == num_layer - 1)
@@ -314,15 +329,18 @@ void train_model()
 				InputForwardBackwardComputation(cur_fw[i], cur_bw[i]++, e[i]);
 				InputForwardCommunication(cur_fw[i]++, e[i]);
 			}
-			else if(i == num_layer - 1)
+			else if(i == num_layer - 1 && e[i] < epoch)
 			{
 				OutputForwardBackwardComputation(cur_fw[i], cur_bw[i], e[i]);
 				OutputForwardBackwardCommunication(cur_fw[i]++, cur_bw[i]++, e[i]);
 			}
 			else
 			{
-				HiddenForwardBackwardComputation(i, cur_fw[i], cur_bw[i], e[i]);
-				HiddenForwardBackwardCommunication(i, cur_fw[i]++, cur_bw[i]++, e[i]);
+				if(e[i] < epoch)
+				{
+					HiddenForwardBackwardComputation(i, cur_fw[i], cur_bw[i], e[i]);
+					HiddenForwardBackwardCommunication(i, cur_fw[i]++, cur_bw[i]++, e[i]);
+				}
 			}
 		}
 
@@ -363,96 +381,105 @@ void train_model()
 //
 //		cudaDeviceSynchronize();
 //	}
-
-	/*
-	// end stage
-	for(int i = 0; i < num_layer; i++)
-	{
-		if(i == 0)
-		{
-			while(cur_bw[i] <= num_data)
-			{
-				InputBackwardComputation(cur_fw[i], cur_bw[i]);
-				InputBackwardCommunication(cur_fw[i]++, cur_bw[i]++);
-			}
-		}
-		else if(i == num_layer - 1)
-		{
-			while(cur_bw[i] <= num_data)
-			{
-				OutputBackwardComputation(cur_fw[i], cur_bw[i]);
-				OutputBackwardCommunication(cur_fw[i]++, cur_bw[i]++);
-			}
-		}
-		else
-		{
-			while(cur_bw[i] <= num_data)
-			{
-				HiddenBackwardComputation(cur_fw[i], cur_bw[i]);
-				HiddenBackwardCommunication(cur_fw[i]++, cur_bw[i]++);
-			}
-		}
-	}
-	*/
 }
 
-/*
 void test_accuracy() 
 {	
-	double correct = 0, num_test_examples = 0, result_index = 0, sum;
-	int max_index;
+	// Set test data
 	FILE* pFile = NULL;
-	char str_tmp[num_node_arr[1] * 3];
-	char* p;
+	char str_tmp[num_node_arr[0] * 3], *p;
+
 	pFile = fopen("mnist_test.csv", "r");
-	if (pFile != NULL)
+	if(pFile != NULL)
 	{
-		while (1)
+		for(int r_index = 0, i_index = 0; r_index < test_num_data;)
 		{
-			// load data from file
-			fgets(str_tmp, num_node_arr[1] * 3, pFile);
-			if (feof(pFile))
-				break;
+			fgets(str_tmp, num_node_arr[0] * 3, pFile);
+
+			// set test_result
 			p = strtok(str_tmp, ",");
-			// set result
 			if(atoi(p) == 0)
-				result_index = num_node_arr[num_layer] - 1;
+				result_host[r_index++] = num_node_arr[num_layer - 1] - 1;
 			else
-				result_index = atof(p);
-			// set input
-			p = strtok(NULL, ",");
-			input_host[0] = 1.0;
-			for (int i = 1; i < num_node_arr[1]; i++)
+				result_host[r_index++] = atoi(p);
+
+			// set test_input
+			input_host[i_index++] = 1.0;
+			for (int i = 1; i < num_node_arr[0]; i++)
 			{
-				input_host[i] = atof(p) / 255.0;
 				p = strtok(NULL, ",");
+				input_host[i_index++] = atof(p) / 255.0;
 			}
-			cudaMemcpy(layer[1].a, input_host, num_node_arr[1] * sizeof(double), cudaMemcpyHostToDevice);
-			// forward pass
-			for(int i = 1; i < num_layer - 1; i++)
-			{
-				MatrixMultiply(layer[i].weight, layer[i].a, layer[i+1].a, num_node_arr[i+1], num_node_arr[i], 1);
-				Sigmoid<<<(num_node_arr[i+1] + 1023) / 1024, 1024>>>(layer[i+1].a, num_node_arr[i+1]);
-			}
-			MatrixMultiply(layer[num_layer - 1].weight, layer[num_layer - 1].a, layer[num_layer].a, num_node_arr[num_layer], num_node_arr[num_layer - 1], 1);
-			Exponential<<<(num_node_arr[num_layer] + 1023) / 1024, 1024>>>(layer[num_layer].a, num_node_arr[num_layer]);
-			cublasDasum(handle, num_node_arr[num_layer], layer[num_layer].a, 1, &sum);
-			Softmax<<<(num_node_arr[num_layer] + 1023) / 1024, 1024>>>(layer[num_layer].a, sum, num_node_arr[num_layer]);
-			//Print<<<1, 1>>>(layer[num_layer].a, num_node_arr[num_layer]);
-			//cudaDeviceSynchronize();
-			
-			cublasIdamax(handle, num_node_arr[num_layer], layer[num_layer].a, 1, &max_index);
-			if (result_index == --max_index)
-				correct++;
-			num_test_examples++;
+	    }
+	}
+
+	cudaSetDevice(0);
+	cudaMemcpy(input_d, input_host, test_num_data * num_node_arr[0] * sizeof(double), cudaMemcpyHostToDevice);
+
+	cudaSetDevice(num_layer - 1);
+	cudaMemcpy(result_d, result_host, test_num_data * sizeof(double), cudaMemcpyHostToDevice);
+
+	cudaMemset(&d_num_correct, 0, sizeof(double));
+
+	for(int i = 0; i < num_layer; i++)
+	{
+		cudaSetDevice(i);
+		cudaDeviceSynchronize();
+	}
+
+	// reset flags
+	for(int i = 0; i < num_layer; i++)
+		cur_fw[i] = 0;
+	
+	for(int i = 0; i < num_layer; i++)
+	{
+		cudaSetDevice(i);
+		for(int j = 0; j < 2; j++)
+		{
+			cudaMemset(&layer[i].is_fw_output_ready[j], 0, sizeof(int));
+			cudaMemset(&layer[i].is_bw_output_ready[j], 0, sizeof(int));
+			cudaMemset(&layer[i].is_fw_input_ready[j], 0, sizeof(int));
+			cudaMemset(&layer[i].is_bw_input_ready[j], 0, sizeof(int));
+			cudaMemset(&layer[i].is_fw_next_input_ready[j], 0, sizeof(int));
+			cudaMemset(&layer[i].is_bw_prev_input_ready[j], 0, sizeof(int));
 		}
 	}
-	if(pFile != NULL)
-		fclose(pFile);
-	
-	printf("%lf%%\n", correct / num_test_examples * 100);
-	return;
-}*/
+
+	for(int i = 0; i < num_layer; i++)
+	{
+		cudaSetDevice(i);
+		cudaDeviceSynchronize();
+	}
+
+
+	while(cur_fw[num_layer - 1] < test_num_data)
+	{
+		for(int i = 0; i < num_layer; i++)
+		{
+			if(i == 0)
+			{
+				InputForwardComputation(cur_fw[i]);
+				InputForwardCommunication(cur_fw[i]++, 0);
+			}
+			else if(i == num_layer - 1)
+				OutputForwardComputation(cur_fw[i]++);
+			else
+			{
+				HiddenForwardComputation(i, cur_fw[i]);
+				HiddenForwardCommunication(i, cur_fw[i]++);
+			}
+		}
+	}
+
+	for(int i = 0; i < num_layer; i++)
+	{
+		cudaSetDevice(i);
+		cudaDeviceSynchronize();
+	}
+
+	cudaMemcpy(&num_correct, d_num_correct, sizeof(double), cudaMemcpyDeviceToHost);
+	printf("%lf\n", num_correct / test_num_data);
+}
 
 void MatrixMultiply(double *d_A, double *d_B, double *d_C, int A_H, int A_W, int B_W, int i)
 {
@@ -521,7 +548,7 @@ void InputForwardBackwardComputation(int fw_index, int bw_index, int e)
 	
 	// current layer's forward output buffer is full
 	cudaMemsetAsync(&layer[0].is_fw_output_ready[fw_buffer], 1, sizeof(int), stream[0]);
-	PrintFw<<<1, 1, 0, stream[0]>>>(0, fw_index, e);
+	// PrintFw<<<1, 1, 0, stream[0]>>>(0, fw_index, e);
 
 	// wait for current layer's backward input buffer is full
 	WaituntilOne<<<1, 1, 0, stream[0]>>>(layer[0].is_bw_input_ready, bw_buffer, __LINE__, bw_index, e, 0);
@@ -532,7 +559,7 @@ void InputForwardBackwardComputation(int fw_index, int bw_index, int e)
 	// current layer's backward input buffer is empty
 	cudaMemsetAsync(&layer[0].is_bw_input_ready[bw_buffer], 0, sizeof(int), stream[0]);
 	cudaMemcpyPeerAsync(&layer[1].is_bw_prev_input_ready[bw_buffer], 1, &layer[0].is_bw_input_ready[bw_buffer], 0, sizeof(int), stream[0]);
-	PrintBw<<<1, 1, 0, stream[0]>>>(0, bw_index, e);
+	// PrintBw<<<1, 1, 0, stream[0]>>>(0, bw_index, e);
 }
 
 void HiddenForwardComputation(int device, int index)
@@ -667,6 +694,25 @@ void HiddenForwardBackwardCommunication(int device, int fw_index, int bw_index, 
 	cudaMemcpyPeerAsync(&layer[device - 1].is_bw_input_ready[bw_buffer], device - 1, &layer[device].is_bw_prev_input_ready[bw_buffer], device, sizeof(int), stream[2 * device + 1]);
 }
 
+void OutputForwardComputation(int fw_index)
+{
+	int fw_buffer = fw_index % 2;
+	cudaSetDevice(num_layer - 1);
+
+	// wait for current layer's forward input buffer is full
+	WaituntilOne<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_fw_input_ready, fw_buffer, __LINE__, fw_index, 0, num_layer - 1);
+
+	// get estimated class
+	GetMaxIndex<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[fw_buffer], num_node_arr[num_layer - 1], d_max_index);
+
+	// compare with real class
+	CheckCorrect<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(result_d, fw_index, d_max_index, d_num_correct);
+
+	// current layer's forward input buffer is empty
+	cudaMemsetAsync(&layer[num_layer - 1].is_fw_input_ready[fw_buffer], 0, sizeof(int), stream[2 * (num_layer - 1)]);
+	cudaMemcpyPeerAsync(&layer[num_layer - 2].is_fw_next_input_ready[fw_buffer], num_layer - 2, &layer[num_layer - 1].is_fw_input_ready[fw_buffer], num_layer - 1, sizeof(int), stream[2 * (num_layer - 1)]);
+}
+
 void OutputForwardBackwardComputation(int fw_index, int bw_index, int e)
 {
 	int fw_buffer = fw_index % 2;
@@ -678,8 +724,8 @@ void OutputForwardBackwardComputation(int fw_index, int bw_index, int e)
 
 	// softmax
 	Exponential<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[fw_buffer], num_node_arr[num_layer - 1]);
-	cublasDasum(handle[num_layer - 1], num_node_arr[num_layer - 1] - 1, layer[num_layer - 1].a[fw_buffer], 1, &sum[fw_buffer]);
-	Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[fw_buffer], sum[fw_buffer], num_node_arr[num_layer - 1]);
+	GetSum<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[fw_buffer], num_node_arr[num_layer - 1], sum);
+	Softmax<<<(num_node_arr[num_layer - 1] + 1023) / 1024, 1024, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].a[fw_buffer], sum, num_node_arr[num_layer - 1]);
 
 	// wait for current layer's backward output buffer is empty
 	WaituntilZero<<<1, 1, 0, stream[2 * (num_layer - 1)]>>>(layer[num_layer - 1].is_bw_output_ready, bw_buffer, __LINE__, bw_index, e, num_layer - 1);
@@ -715,6 +761,32 @@ void OutputForwardBackwardCommunication(int fw_index, int bw_index, int e)
 	// previous layer's backward input buffer is full
 	cudaMemsetAsync(&layer[num_layer - 1].is_bw_prev_input_ready[bw_buffer], 1, sizeof(int), stream[2 * num_layer - 1]);
 	cudaMemcpyPeerAsync(&layer[num_layer - 2].is_bw_input_ready[bw_buffer], num_layer - 2, &layer[num_layer - 1].is_bw_prev_input_ready[bw_buffer], num_layer - 1, sizeof(int), stream[2 * num_layer - 1]);
+}
+
+__global__ void GetSum(double *a, int num_node, double *s)
+{
+	s[0] = 0.0;
+	for(int i = 1; i < num_node; i++)
+		s[0] += a[i];
+}
+
+__global__ void GetMaxIndex(double *a, int num_node, int *index)
+{
+	double max = a[1];
+	for(int i = 2; i < num_node; i++)
+	{
+		if(a[i] > max)
+		{
+			max = a[i];
+			index[0] = i;
+		}
+	}
+}
+__global__ void CheckCorrect(double *test_result_d, int fw_index, int *max_index, double *num_correct)
+{
+	printf("%d %d\n", (int)test_result_d[fw_index], max_index[0]);
+	if((int)test_result_d[fw_index] == max_index[0])
+			num_correct[0]++;
 }
 
 __global__ void GetOutputLayerDelta(double *output_a, double *output_delta, double *result, int index, int size)
@@ -761,18 +833,18 @@ __global__ void Exponential(double *a, int size)
 		a[i] = 0.0;
 }
 
-__global__ void Softmax(double *a, double sum, int size)
+__global__ void Softmax(double *a, double* sum, int size)
 {
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
 	if(i < size)
-		a[i] /= sum;
+		a[i] /= sum[0];
 }
 
 __global__ void WaituntilZero(int *ready, int index, int line, int x, int e, int d)
 {
 	while(ready[index] != 0)
 	{
-		// printf("line: %d\tindex: %d\tepoch: %d\tdevice: %d\n", line, x, e, e);
+		// printf("line: %d\tindex: %d\tepoch: %d\tdevice: %d\n", line, x, e, d);
 	}
 }
 
@@ -799,20 +871,16 @@ __global__ void PrintBw(int device, int index, int e)
 	printf("device #%d\t bw -> %d\tepoch : %d\n", device, index, e);
 }
 
-__global__ void PrintInt(int *flag, int index, int line)
+__global__ void PrintInt(int *arr, int size)
 {
-	printf("line #%d\t index #%d\t %d\n", line, index, flag[index]);
-}
-
-__global__ void PrintDouble(double *flag, int index, int size, int line)
-{
-	printf("line #%d\t", line);
 	for(int i = 0; i < size; i++)
-		printf("%lf ", flag[index + i]);
+		printf("%d ", arr[i]);
 	printf("\n");
 }
 
-__global__ void PrintEnter()
+__global__ void PrintDouble(double *arr, int size)
 {
+	for(int i = 0; i < size; i++)
+		printf("%lf ", arr[i]);
 	printf("\n");
 }
